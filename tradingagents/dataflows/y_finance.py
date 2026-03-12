@@ -128,12 +128,29 @@ def get_stock_stats_indicators_window(
         ),
     }
 
+    # Defensive parsing: if the LLM passed multiple indicators as a comma-separated string,
+    # split and recursively call for each, returning combined results.
+    if "," in indicator:
+        indicators = [item.strip() for item in indicator.split(",") if item.strip()]
+        if indicators:
+            return "\n".join(
+                get_stock_stats_indicators_window(
+                    symbol, item, curr_date, look_back_days
+                )
+                for item in indicators
+            )
+
     if indicator not in best_ind_params:
         raise ValueError(
             f"Indicator {indicator} is not supported. Please choose from: {list(best_ind_params.keys())}"
         )
 
     end_date = curr_date
+    # Fix: some LLMs strip the year from dates
+    if curr_date and len(curr_date) < 8:
+        from datetime import date as _date
+        curr_date = f"{_date.today().year}{curr_date}" if curr_date.startswith("-") else curr_date
+        end_date = curr_date
     curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     before = curr_date_dt - relativedelta(days=look_back_days)
 

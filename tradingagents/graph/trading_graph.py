@@ -200,11 +200,16 @@ class TradingAgentsGraph:
         if self.debug:
             # Debug mode with tracing
             trace = []
+            last_printed_id = None
             for chunk in self.graph.stream(init_agent_state, **args):
                 if len(chunk["messages"]) == 0:
                     pass
                 else:
-                    chunk["messages"][-1].pretty_print()
+                    last_msg = chunk["messages"][-1]
+                    msg_id = getattr(last_msg, "id", None)
+                    if msg_id != last_printed_id:
+                        last_msg.pretty_print()
+                        last_printed_id = msg_id
                     trace.append(chunk)
 
             final_state = trace[-1]

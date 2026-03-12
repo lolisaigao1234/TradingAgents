@@ -1,6 +1,6 @@
 from langchain_core.tools import tool
 from typing import Annotated
-from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.interface import route_to_vendor, route_to_vendor_direct
 
 @tool
 def get_news(
@@ -10,7 +10,7 @@ def get_news(
 ) -> str:
     """
     Retrieve news data for a given ticker symbol.
-    Uses the configured news_data vendor.
+    Uses the configured news_data vendor, supplemented with WSJ newsletter content.
     Args:
         ticker (str): Ticker symbol
         start_date (str): Start date in yyyy-mm-dd format
@@ -18,7 +18,14 @@ def get_news(
     Returns:
         str: A formatted string containing news data
     """
-    return route_to_vendor("get_news", ticker, start_date, end_date)
+    primary = route_to_vendor("get_news", ticker, start_date, end_date)
+    try:
+        wsj = route_to_vendor_direct("get_news", "wsj", ticker, start_date, end_date)
+        if wsj and not wsj.startswith("No WSJ"):
+            return primary + "\n\n---\n\n" + wsj
+    except Exception:
+        pass
+    return primary
 
 @tool
 def get_global_news(
@@ -28,7 +35,7 @@ def get_global_news(
 ) -> str:
     """
     Retrieve global news data.
-    Uses the configured news_data vendor.
+    Uses the configured news_data vendor, supplemented with WSJ newsletter content.
     Args:
         curr_date (str): Current date in yyyy-mm-dd format
         look_back_days (int): Number of days to look back (default 7)
@@ -36,7 +43,14 @@ def get_global_news(
     Returns:
         str: A formatted string containing global news data
     """
-    return route_to_vendor("get_global_news", curr_date, look_back_days, limit)
+    primary = route_to_vendor("get_global_news", curr_date, look_back_days, limit)
+    try:
+        wsj = route_to_vendor_direct("get_global_news", "wsj", curr_date, look_back_days, limit)
+        if wsj and not wsj.startswith("No WSJ"):
+            return primary + "\n\n---\n\n" + wsj
+    except Exception:
+        pass
+    return primary
 
 @tool
 def get_insider_transactions(

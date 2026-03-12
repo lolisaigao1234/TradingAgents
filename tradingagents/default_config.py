@@ -22,13 +22,18 @@ DEFAULT_CONFIG = {
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance, coingecko (auto for crypto)
+        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance, coingecko (auto for crypto)
+        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance, coingecko (auto for crypto)
+        "news_data": "yfinance",             # Options: alpha_vantage, yfinance; wsj always supplements
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
+    # CoinGecko configuration (optional — free tier works without key)
+    "coingecko_api_key": os.getenv("COINGECKO_API_KEY"),
+    # WSJ news integration
+    "wsj_scraper_path": "/mnt/acacia_rw/scripts/wsj-scraper.py",
+    "wsj_max_scrape_articles": 3,
 }
