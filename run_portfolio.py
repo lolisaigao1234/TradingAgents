@@ -53,7 +53,7 @@ def _make_config():
     config = DEFAULT_CONFIG.copy()
     config["llm_provider"] = "google"
     config["deep_think_llm"] = "gemini-3.1-pro-preview"
-    config["quick_think_llm"] = "gemini-3.1-pro-preview"
+    config["quick_think_llm"] = "gemini-3.1-flash-lite-preview"
     config["google_vertexai"] = True
     config["google_cloud_project"] = os.getenv("GOOGLE_CLOUD_PROJECT", config.get("google_cloud_project"))
     config["google_cloud_location"] = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
