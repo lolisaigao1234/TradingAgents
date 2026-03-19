@@ -48,8 +48,11 @@ def split_batches(tickers, batch_size):
 def run_analysis(tickers, analysis_date):
     config = DEFAULT_CONFIG.copy()
     config["llm_provider"] = "google"
-    config["deep_think_llm"] = "gemini-2.5-pro"
-    config["quick_think_llm"] = "gemini-2.5-pro"
+    config["deep_think_llm"] = "gemini-3.1-pro-preview"
+    config["quick_think_llm"] = "gemini-3.1-pro-preview"
+    config["google_vertexai"] = True
+    config["google_cloud_project"] = os.getenv("GOOGLE_CLOUD_PROJECT", config.get("google_cloud_project"))
+    config["google_cloud_location"] = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
 

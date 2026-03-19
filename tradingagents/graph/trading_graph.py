@@ -142,6 +142,18 @@ class TradingAgentsGraph:
             thinking_level = self.config.get("google_thinking_level")
             if thinking_level:
                 kwargs["thinking_level"] = thinking_level
+            if self.config.get("google_api_key"):
+                kwargs["google_api_key"] = self.config.get("google_api_key")
+            if self.config.get("google_service_account_json"):
+                kwargs["google_service_account_json"] = self.config.get("google_service_account_json")
+            if self.config.get("google_service_account_secret_id"):
+                kwargs["google_service_account_secret_id"] = self.config.get("google_service_account_secret_id")
+            if "google_vertexai" in self.config:
+                kwargs["vertexai"] = self.config.get("google_vertexai")
+            if self.config.get("google_cloud_project"):
+                kwargs["project"] = self.config.get("google_cloud_project")
+            if self.config.get("google_cloud_location"):
+                kwargs["location"] = self.config.get("google_cloud_location")
 
         elif provider == "openai":
             reasoning_effort = self.config.get("openai_reasoning_effort")
