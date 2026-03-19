@@ -36,7 +36,11 @@ class GoogleClient(BaseLLMClient):
 
     def get_llm(self) -> Any:
         """Return configured ChatGoogleGenerativeAI instance."""
-        llm_kwargs = {"model": self.model}
+        llm_kwargs = {
+            "model": self.model,
+            "timeout": 120,
+            "max_retries": 1,
+        }
 
         for key in ("timeout", "max_retries", "google_api_key", "callbacks", "http_client", "http_async_client"):
             if key in self.kwargs:

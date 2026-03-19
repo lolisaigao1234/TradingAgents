@@ -13,6 +13,7 @@ Usage:
 import os
 import sys
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
@@ -45,38 +46,54 @@ def split_batches(tickers, batch_size):
     """Split tickers into batches of batch_size."""
     return [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
 
-def run_analysis(tickers, analysis_date):
+MAX_CONCURRENT_TICKERS = 3  # Vertex AI rate limit safety cap
+
+def _make_config():
+    """Build a shared config dict for TradingAgentsGraph."""
     config = DEFAULT_CONFIG.copy()
     config["llm_provider"] = "google"
     config["deep_think_llm"] = "gemini-3.1-pro-preview"
-    config["quick_think_llm"] = "gemini-3.1-pro-preview"
+    config["quick_think_llm"] = "gemini-3.1-flash-lite-preview"
     config["google_vertexai"] = True
     config["google_cloud_project"] = os.getenv("GOOGLE_CLOUD_PROJECT", config.get("google_cloud_project"))
     config["google_cloud_location"] = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
+    return config
 
-    ta = TradingAgentsGraph(debug=True, config=config)
+def _analyze_one(ticker, analysis_date, config):
+    """Analyze a single ticker (designed to run in a thread)."""
+    print(f"\n{'='*60}")
+    print(f"  Analyzing {ticker} | Date: {analysis_date}")
+    print(f"  Avg Cost: ${PORTFOLIO.get(ticker, '?')}")
+    print(f"{'='*60}\n")
+
+    try:
+        ta = TradingAgentsGraph(debug=True, config=config)
+        _, decision = ta.propagate(ticker, analysis_date)
+        print(f"\n>>> {ticker} DECISION: {decision[:200]}...")
+        return ticker, {
+            "decision": decision,
+            "avg_cost": PORTFOLIO.get(ticker),
+            "status": "ok",
+        }
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(f"\n>>> {ticker} ERROR: {err}")
+        return ticker, {"decision": None, "error": err, "status": "error"}
+
+def run_analysis(tickers, analysis_date):
+    config = _make_config()
     results = {}
 
-    for ticker in tickers:
-        print(f"\n{'='*60}")
-        print(f"  Analyzing {ticker} | Date: {analysis_date}")
-        print(f"  Avg Cost: ${PORTFOLIO.get(ticker, '?')}")
-        print(f"{'='*60}\n")
-
-        try:
-            _, decision = ta.propagate(ticker, analysis_date)
-            results[ticker] = {
-                "decision": decision,
-                "avg_cost": PORTFOLIO.get(ticker),
-                "status": "ok",
-            }
-            print(f"\n>>> {ticker} DECISION: {decision[:200]}...")
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            results[ticker] = {"decision": None, "error": err, "status": "error"}
-            print(f"\n>>> {ticker} ERROR: {err}")
+    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENT_TICKERS, len(tickers))) as pool:
+        futures = {
+            pool.submit(_analyze_one, ticker, analysis_date, config): ticker
+            for ticker in tickers
+        }
+        for future in as_completed(futures):
+            ticker, result = future.result()
+            results[ticker] = result
 
     return results
 

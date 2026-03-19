@@ -210,7 +210,7 @@ class TradingAgentsGraph:
         args = self.propagator.get_graph_args()
 
         if self.debug:
-            # Debug mode with tracing
+            # Debug mode with tracing (truncated output)
             trace = []
             last_printed_id = None
             for chunk in self.graph.stream(init_agent_state, **args):
@@ -220,7 +220,7 @@ class TradingAgentsGraph:
                     last_msg = chunk["messages"][-1]
                     msg_id = getattr(last_msg, "id", None)
                     if msg_id != last_printed_id:
-                        last_msg.pretty_print()
+                        self._debug_print(last_msg)
                         last_printed_id = msg_id
                     trace.append(chunk)
 
@@ -237,6 +237,34 @@ class TradingAgentsGraph:
 
         # Return decision and processed signal
         return final_state, self.process_signal(final_state["final_trade_decision"])
+
+    @staticmethod
+    def _debug_print(msg, max_content_len=500):
+        """Print a debug-friendly summary of a message, truncating long tool output."""
+        role = getattr(msg, "type", "unknown")
+        name = getattr(msg, "name", "")
+        label = f"{role}({name})" if name else role
+
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):
+            # Flatten list-style content (Gemini 3 format)
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(item.get("text", str(item)))
+                else:
+                    parts.append(str(item))
+            content = "\n".join(parts)
+
+        if len(content) > max_content_len:
+            content = content[:max_content_len] + f"... [truncated, {len(content)} chars total]"
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        tc_info = f" | {len(tool_calls)} tool_call(s)" if tool_calls else ""
+
+        print(f"[DEBUG] {label}{tc_info}")
+        if content:
+            print(content)
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

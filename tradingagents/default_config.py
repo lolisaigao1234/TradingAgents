@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     # LLM settings
     "llm_provider": os.getenv("TRADINGAGENTS_LLM_PROVIDER", "google"),
     "deep_think_llm": os.getenv("TRADINGAGENTS_DEEP_MODEL", "gemini-3.1-pro-preview"),
-    "quick_think_llm": os.getenv("TRADINGAGENTS_QUICK_MODEL", "gemini-3.1-pro-preview"),
+    "quick_think_llm": os.getenv("TRADINGAGENTS_QUICK_MODEL", "gemini-3.1-flash-lite-preview"),
     "backend_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
     # Provider-specific thinking configuration
     "google_thinking_level": os.getenv("TRADINGAGENTS_GOOGLE_THINKING_LEVEL"),      # "high", "minimal", etc.
