@@ -1,7 +1,7 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
-from tradingagents.agents.utils.agent_utils import get_news
+from tradingagents.agents.utils.agent_utils import get_news, filter_messages_for_tools, run_tool_loop
 from tradingagents.dataflows.config import get_config
 
 
@@ -43,17 +43,12 @@ def create_social_media_analyst(llm):
         prompt = prompt.partial(ticker=ticker)
 
         chain = prompt | llm.bind_tools(tools)
-
-        result = chain.invoke(state["messages"])
-
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = result.content
+        tool_names = [t.name for t in tools]
+        filtered = filter_messages_for_tools(state["messages"], tool_names)
+        result = run_tool_loop(chain, tools, filtered)
 
         return {
-            "messages": [result],
-            "sentiment_report": report,
+            "sentiment_report": result.content,
         }
 
     return social_media_analyst_node
