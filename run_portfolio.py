@@ -13,10 +13,38 @@ Usage:
 import os
 import sys
 import json
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 load_dotenv()
+
+def _inject_vertex_credentials():
+    """Retrieve Vertex AI SA JSON via secret-resolver and set env var."""
+    if os.environ.get("GOOGLE_VERTEX_SA_JSON"):
+        return  # already set
+
+    try:
+        request = json.dumps({
+            "protocolVersion": 1,
+            "ids": ["vertex-embed/oauth/serviceAccountJson"],
+        })
+        result = subprocess.run(
+            ["sudo", "-n", "-u", "credproxy", "/usr/bin/node",
+             "/opt/openclaw-security/secret-resolver.mjs"],
+            input=request, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            payload = json.loads(result.stdout)
+            sa_json = payload["values"]["vertex-embed/oauth/serviceAccountJson"]
+            os.environ["GOOGLE_VERTEX_SA_JSON"] = sa_json
+            print("Vertex AI credentials loaded via secret-resolver")
+        else:
+            print(f"Warning: secret-resolver failed (rc={result.returncode}): {result.stderr.strip()}")
+    except Exception as e:
+        print(f"Warning: could not load Vertex AI credentials: {e}")
+
+_inject_vertex_credentials()
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -57,6 +85,9 @@ def _make_config():
     config["google_vertexai"] = True
     config["google_cloud_project"] = os.getenv("GOOGLE_CLOUD_PROJECT", config.get("google_cloud_project"))
     config["google_cloud_location"] = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+    sa_json = os.getenv("GOOGLE_VERTEX_SA_JSON")
+    if sa_json:
+        config["google_service_account_json"] = sa_json
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
     return config
