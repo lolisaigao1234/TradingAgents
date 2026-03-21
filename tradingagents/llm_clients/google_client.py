@@ -51,12 +51,37 @@ class GoogleClient(BaseLLMClient):
             return True
         return False
 
+    def _resolve_secret(self, secret_id: str) -> str | None:
+        """Resolve a secret via secret-resolver subprocess."""
+        import subprocess
+        try:
+            request = json.dumps({"protocolVersion": 1, "ids": [secret_id]})
+            result = subprocess.run(
+                ["sudo", "-n", "-u", "credproxy", "/usr/bin/node",
+                 "/opt/openclaw-security/secret-resolver.mjs"],
+                input=request, capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                payload = json.loads(result.stdout)
+                return payload.get("values", {}).get(secret_id)
+        except Exception:
+            pass
+        return None
+
     def _get_vertex_credentials(self):
         """Build Vertex AI credentials from service account JSON."""
         sa_json = (
             self.kwargs.get("google_service_account_json")
             or os.environ.get("GOOGLE_VERTEX_SA_JSON")
         )
+        # Try resolving from secret-resolver if we have a secret ID but no SA JSON
+        if not sa_json:
+            secret_id = self.kwargs.get("google_service_account_secret_id")
+            if secret_id:
+                sa_json = self._resolve_secret(secret_id)
+                if sa_json:
+                    os.environ["GOOGLE_VERTEX_SA_JSON"] = sa_json
+
         if not sa_json:
             return None
         sa_info = json.loads(sa_json) if isinstance(sa_json, str) else sa_json

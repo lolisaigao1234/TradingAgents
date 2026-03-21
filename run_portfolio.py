@@ -27,7 +27,7 @@ def _inject_vertex_credentials():
     try:
         request = json.dumps({
             "protocolVersion": 1,
-            "ids": ["googleVertex/serviceAccountJson"],
+            "ids": ["vertex-embed/oauth/serviceAccountJson"],
         })
         result = subprocess.run(
             ["sudo", "-n", "-u", "credproxy", "/usr/bin/node",
@@ -36,7 +36,7 @@ def _inject_vertex_credentials():
         )
         if result.returncode == 0 and result.stdout.strip():
             payload = json.loads(result.stdout)
-            sa_json = payload["values"]["googleVertex/serviceAccountJson"]
+            sa_json = payload["values"]["vertex-embed/oauth/serviceAccountJson"]
             os.environ["GOOGLE_VERTEX_SA_JSON"] = sa_json
             print("Vertex AI credentials loaded via secret-resolver")
         else:
