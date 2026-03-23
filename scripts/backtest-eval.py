@@ -17,7 +17,7 @@ import sys
 import json
 import subprocess
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Ensure project root is on sys.path so `tradingagents` is importable
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +62,20 @@ def _inject_vertex_credentials():
 
 
 def _make_config():
-    """Build a config dict for TradingAgentsGraph."""
+    """Build a backtest-specific config for TradingAgentsGraph.
+
+    Data leakage safety for backtesting:
+      SAFE (honor trade_date): market_analyst (get_stock_data, get_indicators)
+      UNSAFE (return live/current data, ignoring trade_date):
+        - fundamentals_analyst: get_fundamentals, get_balance_sheet, get_cashflow,
+          get_income_statement — yfinance returns latest-filed fundamentals regardless
+          of date.
+        - news_analyst: get_news, get_global_news — returns current headlines, not
+          headlines as-of trade_date.
+        - social_media_analyst: get_news — same issue as news.
+
+    Phase 1: only enable market analyst (historical price/indicator data is date-safe).
+    """
     from tradingagents.default_config import DEFAULT_CONFIG
 
     config = DEFAULT_CONFIG.copy()
@@ -79,18 +92,32 @@ def _make_config():
     config["max_risk_discuss_rounds"] = 1
     return config
 
+# Analysts safe for backtesting (no data leakage). See _make_config() docstring.
+_BACKTEST_SAFE_ANALYSTS = ["market"]
+
 
 # ---------------------------------------------------------------------------
 # Signal parser
 # ---------------------------------------------------------------------------
 
-_SIGNAL_RE = re.compile(r'\b(BUY|SELL|HOLD)\b')
+_VALID_SIGNALS = {"BUY", "SELL", "HOLD"}
+_SIGNAL_RE = re.compile(r'\b(BUY|SELL|HOLD)\b', re.IGNORECASE)
 
 
 def parse_signal(raw_signal: str) -> str:
-    """Extract BUY/SELL/HOLD from LLM prose. Returns INCONCLUSIVE if no match."""
+    """Extract BUY/SELL/HOLD from LLM prose. Returns INCONCLUSIVE if no match.
+
+    Strategy: first try exact match on stripped/uppercased text (handles clean
+    propagate() output). If that fails, use case-insensitive word-boundary regex.
+    """
+    # Fast path: propagate() may return a clean signal directly
+    stripped = raw_signal.strip().upper()
+    if stripped in _VALID_SIGNALS:
+        return stripped
+
+    # Fallback: search for signal word in prose
     match = _SIGNAL_RE.search(raw_signal)
-    return match.group(1) if match else "INCONCLUSIVE"
+    return match.group(1).upper() if match else "INCONCLUSIVE"
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +131,6 @@ def get_close_price(ticker: str, target_date: str, search_forward_days: int = 10
     """
     dt = datetime.strptime(target_date, "%Y-%m-%d")
     # Fetch a window to account for weekends/holidays
-    from datetime import timedelta
     start = dt
     end = dt + timedelta(days=search_forward_days)
 
@@ -131,14 +157,15 @@ def get_close_price(ticker: str, target_date: str, search_forward_days: int = 10
 def compute_return(ticker: str, trade_date: str, horizon_days: int = 5):
     """Compute percentage return from trade_date to horizon_days trading days later.
 
-    Returns (entry_date, exit_date, pct_change) or (None, None, None).
+    Returns (entry_date, exit_date, pct_change, status) where status is one of:
+      "OK" - full horizon data available
+      "PARTIAL_HORIZON" - insufficient trading days, excluded from accuracy
+      "NO_DATA" - no price data at all
     """
     entry_date, entry_price = get_close_price(ticker, trade_date)
     if entry_price is None:
-        return None, None, None
+        return None, None, None, "NO_DATA"
 
-    # Get price ~horizon trading days later (use calendar days * 1.5 to be safe)
-    from datetime import timedelta
     dt = datetime.strptime(entry_date, "%Y-%m-%d")
     future_start = dt + timedelta(days=1)
     future_end = dt + timedelta(days=horizon_days * 3)
@@ -152,22 +179,21 @@ def compute_return(ticker: str, trade_date: str, horizon_days: int = 5):
         multi_level_index=False,
     )
 
-    if data.empty or len(data) < horizon_days:
-        # Not enough trading days available yet
-        if data.empty:
-            return entry_date, None, None
-        # Use whatever we have if less than horizon
-        exit_row = data.iloc[-1]
-    else:
-        exit_row = data.iloc[horizon_days - 1]
+    if data.empty:
+        return entry_date, None, None, "NO_DATA"
 
-    exit_date = data.index[min(horizon_days - 1, len(data) - 1)]
+    if len(data) < horizon_days:
+        # Not enough trading days — do NOT silently fall back to shorter horizon
+        return entry_date, None, None, "PARTIAL_HORIZON"
+
+    exit_row = data.iloc[horizon_days - 1]
+    exit_date = data.index[horizon_days - 1]
     if hasattr(exit_date, "strftime"):
         exit_date = exit_date.strftime("%Y-%m-%d")
 
     exit_price = float(exit_row["Close"])
     pct_change = ((exit_price - entry_price) / entry_price) * 100.0
-    return entry_date, str(exit_date), pct_change
+    return entry_date, str(exit_date), pct_change, "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +201,16 @@ def compute_return(ticker: str, trade_date: str, horizon_days: int = 5):
 # ---------------------------------------------------------------------------
 
 def evaluate_decision(decision: str, pct_change: float, threshold: float = 1.0) -> bool:
-    """Check if a decision was directionally correct given the price change."""
+    """Check if a decision was directionally correct given the price change.
+
+    Boundaries are consistent: BUY >= threshold, SELL <= -threshold, HOLD inside.
+    """
     if decision == "BUY":
-        return pct_change > threshold
+        return pct_change >= threshold
     elif decision == "SELL":
-        return pct_change < -threshold
+        return pct_change <= -threshold
     elif decision == "HOLD":
-        return abs(pct_change) <= threshold
+        return abs(pct_change) < threshold
     return False
 
 
@@ -197,9 +226,13 @@ def _timeout_handler(signum, frame):
     raise TimeoutError("propagate() timed out")
 
 
-def run_single_date(ticker: str, date: str, config: dict, verbose: bool = False):
+def run_single_date(ticker: str, date: str, config: dict, verbose: bool = False,
+                    selected_analysts: list = None):
     """Run propagate() for a single (ticker, date). Returns a result dict."""
     from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    if selected_analysts is None:
+        selected_analysts = _BACKTEST_SAFE_ANALYSTS
 
     result = {
         "date": date,
@@ -217,7 +250,8 @@ def run_single_date(ticker: str, date: str, config: dict, verbose: bool = False)
         if verbose:
             print(f"  [{date}] Running propagate({ticker}, {date})...", file=sys.stderr)
 
-        ta = TradingAgentsGraph(debug=verbose, config=config)
+        ta = TradingAgentsGraph(debug=verbose, config=config,
+                                selected_analysts=selected_analysts)
         _, raw_signal = ta.propagate(ticker, date)
 
         result["raw_signal"] = raw_signal
@@ -249,6 +283,12 @@ def run_single_date(ticker: str, date: str, config: dict, verbose: bool = False)
 # Main
 # ---------------------------------------------------------------------------
 
+def _validate_date(date_str: str) -> str:
+    """Validate YYYY-MM-DD format. Raises ValueError if invalid."""
+    datetime.strptime(date_str, "%Y-%m-%d")
+    return date_str
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest evaluator for TradingAgents")
     parser.add_argument("--ticker", required=True, help="Stock ticker symbol")
@@ -257,8 +297,29 @@ def main():
     parser.add_argument("--horizon", type=int, default=5, help="Trading days to measure return (default: 5)")
     args = parser.parse_args()
 
-    ticker = args.ticker.upper()
-    dates = [d.strip() for d in args.dates.split(",")]
+    # --- CLI validation (#6) ---
+    ticker = args.ticker.strip().upper()
+    if not ticker:
+        parser.error("--ticker must not be empty")
+
+    if args.horizon < 1:
+        parser.error("--horizon must be >= 1")
+
+    # Parse dates: drop empty tokens, validate format
+    raw_tokens = [d.strip() for d in args.dates.split(",")]
+    dates = []
+    for tok in raw_tokens:
+        if not tok:
+            continue  # skip empty tokens from trailing commas etc.
+        try:
+            _validate_date(tok)
+        except ValueError:
+            parser.error(f"Invalid date format '{tok}', expected YYYY-MM-DD")
+        dates.append(tok)
+
+    if not dates:
+        parser.error("--dates must contain at least one valid date")
+
     verbose = args.verbose
 
     # Inject credentials
@@ -268,6 +329,7 @@ def main():
 
     if verbose:
         print(f"Backtest: {ticker} | Dates: {dates} | Horizon: {args.horizon}d", file=sys.stderr)
+        print(f"  Safe analysts: {_BACKTEST_SAFE_ANALYSTS}", file=sys.stderr)
 
     # Run propagate for each date
     run_results = []
@@ -293,7 +355,21 @@ def main():
             details.append(f"INCONCLUSIVE({r['date']})")
             continue
 
-        entry_date, exit_date, pct_change = compute_return(ticker, r["date"], args.horizon)
+        # Per-date try/except for price data (#3) — one date's yfinance failure
+        # must not kill the whole run.
+        try:
+            entry_date, exit_date, pct_change, price_status = compute_return(
+                ticker, r["date"], args.horizon
+            )
+        except Exception as e:
+            details.append(f"{decision}({r['date']}):PRICE_ERROR")
+            if verbose:
+                print(f"  [{r['date']}] PRICE_ERROR: {e}", file=sys.stderr)
+            continue
+
+        if price_status == "PARTIAL_HORIZON":
+            details.append(f"{decision}({r['date']}):PARTIAL_HORIZON")
+            continue
 
         if pct_change is None:
             details.append(f"{decision}({r['date']}):no_price_data")
