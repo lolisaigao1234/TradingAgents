@@ -74,7 +74,7 @@ def split_batches(tickers, batch_size):
     """Split tickers into batches of batch_size."""
     return [tickers[i:i + batch_size] for i in range(0, len(tickers), batch_size)]
 
-MAX_CONCURRENT_TICKERS = 3  # Vertex AI rate limit safety cap
+MAX_CONCURRENT_TICKERS = 1  # Serial execution — Vertex AI QPM can't handle parallel ticker + parallel analyst
 
 def _make_config():
     """Build a shared config dict for TradingAgentsGraph."""
