@@ -1,0 +1,12 @@
+experiment:
+  id: evolve-fundamentals-001
+  domain: tradingagents
+  allowed_files:
+    - tradingagents/agents/analysts/fundamentals_analyst.py
+  eval_script: scripts/backtest-eval.py
+  eval_args: "--ticker NVDA --dates 2026-03-10,2026-03-14,2026-03-17"
+  metric: directional_accuracy
+  direction: maximize
+  max_variations: 10
+  timeout_per_run: 600
+  early_stop_after: 2
