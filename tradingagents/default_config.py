@@ -21,6 +21,9 @@ DEFAULT_CONFIG = {
     "google_service_account_json": os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"),
     "google_service_account_secret_id": os.getenv("GOOGLE_VERTEX_SERVICE_ACCOUNT_SECRET_ID", "vertex-embed/oauth/serviceAccountJson"),
     "openai_reasoning_effort": os.getenv("TRADINGAGENTS_OPENAI_REASONING_EFFORT"),    # "medium", "high", "low"
+    # LLM request settings
+    "llm_timeout": 120,       # per-request timeout in seconds
+    "llm_max_retries": 1,     # max retries on transient failures
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,

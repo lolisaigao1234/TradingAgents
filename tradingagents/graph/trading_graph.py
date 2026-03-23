@@ -118,6 +118,13 @@ class TradingAgentsGraph:
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
+
+        # Pass through timeout/max_retries from top-level config
+        if "llm_timeout" in self.config:
+            kwargs["timeout"] = self.config["llm_timeout"]
+        if "llm_max_retries" in self.config:
+            kwargs["max_retries"] = self.config["llm_max_retries"]
+
         provider = self.config.get("llm_provider", "").lower()
 
         if provider == "google":

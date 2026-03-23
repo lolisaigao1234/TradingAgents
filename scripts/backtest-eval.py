@@ -90,6 +90,8 @@ def _make_config():
         config["google_service_account_json"] = sa_json
     config["max_debate_rounds"] = 1
     config["max_risk_discuss_rounds"] = 1
+    config["llm_timeout"] = 300       # backtest needs more time per request
+    config["llm_max_retries"] = 2     # retry once on transient failures
     return config
 
 # Analysts safe for backtesting (no data leakage). See _make_config() docstring.
