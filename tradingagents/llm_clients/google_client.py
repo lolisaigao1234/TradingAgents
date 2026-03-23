@@ -107,8 +107,8 @@ class GoogleClient(BaseLLMClient):
         """Return configured Google LLM instance (Vertex AI or AI Studio)."""
         llm_kwargs = {
             "model": self.model,
-            "timeout": 120,
-            "max_retries": 1,
+            "timeout": self.kwargs.get("timeout", 120),
+            "max_retries": self.kwargs.get("max_retries", 1),
         }
 
         for key in ("timeout", "max_retries", "google_api_key", "callbacks", "http_client", "http_async_client"):
