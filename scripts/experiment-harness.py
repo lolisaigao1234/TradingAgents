@@ -133,18 +133,26 @@ def create_worktree(experiment_id: str) -> str:
     return worktree_path
 
 
-def cleanup_worktree(experiment_id: str, worktree_path: str):
-    """Remove worktree and its branch."""
+def cleanup_worktree(experiment_id: str, worktree_path: str, preserve_branch: bool = False):
+    """Remove worktree and optionally its branch.
+
+    If preserve_branch is True, the worktree directory is removed but the
+    branch is kept so that cross-validate.py can still reference it.
+    """
     branch_name = f"evolve/{experiment_id}-{os.getpid()}"
     try:
         _run_git("worktree", "remove", "--force", worktree_path)
     except RuntimeError:
         shutil.rmtree(worktree_path, ignore_errors=True)
-    try:
-        _run_git("branch", "-D", branch_name)
-    except RuntimeError:
-        pass
-    print(f"  Cleaned up worktree: {worktree_path}", file=sys.stderr)
+    if preserve_branch:
+        print(f"  Cleaned up worktree: {worktree_path}", file=sys.stderr)
+        print(f"  Branch preserved for cross-validation: {branch_name}", file=sys.stderr)
+    else:
+        try:
+            _run_git("branch", "-D", branch_name)
+        except RuntimeError:
+            pass
+        print(f"  Cleaned up worktree and branch: {worktree_path}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -575,27 +583,31 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 print(f"  {var_id} IMPROVED over baseline ({var_metric:.3f} vs {baseline_metric:.3f})", file=sys.stderr)
 
     finally:
-        # Step 4: Clean up worktree
-        cleanup_worktree(experiment_id, worktree_path)
+        # Determine if any candidates should be kept
+        has_keep = any(r["status"] == "keep" for r in results if r["variation"] != "baseline")
 
-    # Step 5: Write results
-    results_dir = os.path.join(_PROJECT_ROOT, "experiments")
-    os.makedirs(results_dir, exist_ok=True)
-    tsv_path = os.path.join(results_dir, f"{experiment_id}-results.tsv")
-    write_results_tsv(results, tsv_path)
-    print(f"\n  Results written to {tsv_path}", file=sys.stderr)
+        # Step 4a: Write results before cleanup (needed for hint)
+        results_dir = os.path.join(_PROJECT_ROOT, "experiments")
+        os.makedirs(results_dir, exist_ok=True)
+        tsv_path = os.path.join(results_dir, f"{experiment_id}-results.tsv")
+        write_results_tsv(results, tsv_path)
+        print(f"\n  Results written to {tsv_path}", file=sys.stderr)
 
-    # Step 6: Print ranked table
-    print_results_table(results)
+        # Step 4b: Print ranked table
+        print_results_table(results)
 
-    # Step 7: Print cross-validate command hint
-    branch_name = f"evolve/{experiment_id}-{os.getpid()}"
-    manifest_path = manifest.get("_manifest_path", "experiments/nvda-market.yaml")
-    print(f"\n  To cross-validate results:", file=sys.stderr)
-    print(f"    python scripts/cross-validate.py \\", file=sys.stderr)
-    print(f"      --results-tsv {tsv_path} \\", file=sys.stderr)
-    print(f"      --branch {branch_name} \\", file=sys.stderr)
-    print(f"      --manifest {manifest_path}", file=sys.stderr)
+        # Step 4c: Print cross-validate hint BEFORE cleanup so branch still exists
+        branch_name = f"evolve/{experiment_id}-{os.getpid()}"
+        manifest_path = manifest.get("_manifest_path", "experiments/nvda-market.yaml")
+        if has_keep:
+            print(f"\n  To cross-validate results:", file=sys.stderr)
+            print(f"    python scripts/cross-validate.py \\", file=sys.stderr)
+            print(f"      --results-tsv {tsv_path} \\", file=sys.stderr)
+            print(f"      --branch {branch_name} \\", file=sys.stderr)
+            print(f"      --manifest {manifest_path}", file=sys.stderr)
+
+        # Step 4d: Clean up worktree; preserve branch if there are 'keep' candidates
+        cleanup_worktree(experiment_id, worktree_path, preserve_branch=has_keep)
 
     return results
 
