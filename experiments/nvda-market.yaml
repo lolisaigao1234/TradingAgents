@@ -1,12 +1,17 @@
 experiment:
-  id: evolve-market-001
+  id: evolve-market-002
   domain: tradingagents
   allowed_files:
     - tradingagents/agents/analysts/market_analyst.py
   eval_script: scripts/backtest-eval.py
-  eval_args: "--ticker NVDA --dates 2026-03-10,2026-03-14,2026-03-17"
+  eval_args: "--ticker NVDA --n-dates 50 --date-range 2025-09-01,2026-03-17 --output-json --workers 3"
   metric: directional_accuracy
   direction: maximize
   max_variations: 10
   timeout_per_run: 600
-  early_stop_after: 2
+  early_stop_after: 10
+  n_dates: 50
+  significance_alpha: 0.05
+  kill_gates:
+    max_accuracy_for_kill: 0.55
+    min_ceiling: 0.60
