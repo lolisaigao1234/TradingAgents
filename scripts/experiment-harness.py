@@ -243,7 +243,7 @@ def _replace_dates(eval_args: str, dates: list[str]) -> str:
         else:
             result.append(parts[i])
             i += 1
-    return " ".join(result)
+    return " ".join(shlex.quote(p) for p in result)
 
 
 # ---------------------------------------------------------------------------
