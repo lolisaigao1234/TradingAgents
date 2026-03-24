@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -190,11 +191,14 @@ def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
     Returns dict with keys: directional_accuracy, weighted_accuracy, details, raw.
     On failure returns None.
     """
-    cmd = ["python", eval_script] + eval_args.split()
-    result = subprocess.run(
-        cmd, capture_output=True, text=True,
-        cwd=cwd, timeout=timeout,
-    )
+    cmd = [sys.executable, eval_script] + shlex.split(eval_args)
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            cwd=cwd, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
 
     if result.returncode != 0:
         return None
@@ -219,7 +223,7 @@ def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
 
 def _extract_dates(eval_args: str) -> list[str]:
     """Extract the comma-separated dates list from eval_args string."""
-    parts = eval_args.split()
+    parts = shlex.split(eval_args)
     for i, p in enumerate(parts):
         if p == "--dates" and i + 1 < len(parts):
             return [d.strip() for d in parts[i + 1].split(",") if d.strip()]
@@ -228,7 +232,7 @@ def _extract_dates(eval_args: str) -> list[str]:
 
 def _replace_dates(eval_args: str, dates: list[str]) -> str:
     """Return eval_args with the --dates value replaced."""
-    parts = eval_args.split()
+    parts = shlex.split(eval_args)
     result = []
     i = 0
     while i < len(parts):
@@ -286,7 +290,7 @@ def generate_variation(
 
     # Extract dates from eval_args for context
     dates = ""
-    for part in eval_args.split():
+    for part in shlex.split(eval_args):
         if "," in part or (len(part) == 10 and "-" in part):
             dates = part
             break
@@ -427,6 +431,20 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
             "description": "unchanged prompts",
         })
 
+        # Pre-compute partial baseline for early-stop comparison (Issue #9)
+        _partial_baseline_metric = None
+        all_dates = _extract_dates(eval_args)
+        if not dry_run and early_stop_after and 0 < early_stop_after < len(all_dates):
+            early_dates = all_dates[:early_stop_after]
+            early_eval_args = _replace_dates(eval_args, early_dates)
+            print(f"  Computing baseline on first {early_stop_after} dates for early-stop comparison...", file=sys.stderr)
+            _partial_bl = run_eval(eval_script, early_eval_args, worktree_path, timeout)
+            if _partial_bl is not None:
+                _partial_baseline_metric = _partial_bl[metric_key]
+                print(f"  Partial baseline {metric_key}: {_partial_baseline_metric:.3f}", file=sys.stderr)
+            else:
+                print("  Warning: could not compute partial baseline, early-stop disabled", file=sys.stderr)
+
         # Step 3: Generate and evaluate variations
         for var_num in range(1, n_variations + 1):
             var_id = f"var-{var_num:03d}"
@@ -467,6 +485,20 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
 
             # Commit the variation (Issue #6: use _run_git)
             _run_git("add", *allowed_files, cwd=worktree_path)
+            # Check if there are staged changes before committing
+            has_staged = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=worktree_path,
+            ).returncode != 0
+            if not has_staged:
+                print(f"  {var_id} no changes made, skipping", file=sys.stderr)
+                results.append({
+                    "variation": var_id,
+                    "metric": 0.0,
+                    "status": "discard",
+                    "description": "no changes made",
+                })
+                continue
             _run_git("commit", "-m", f"{var_id}: {description}", cwd=worktree_path)
 
             # Evaluate
@@ -476,10 +508,7 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 var_metric = 0.0
             else:
                 # Issue #9: early_stop_after — run first N dates, bail if worse
-                all_dates = _extract_dates(eval_args)
-                early_stopped = False
-
-                if early_stop_after and 0 < early_stop_after < len(all_dates):
+                if _partial_baseline_metric is not None and early_stop_after and 0 < early_stop_after < len(all_dates):
                     early_dates = all_dates[:early_stop_after]
                     early_eval_args = _replace_dates(eval_args, early_dates)
                     print(f"  Early-stop check: evaluating first {early_stop_after} dates...", file=sys.stderr)
@@ -497,11 +526,11 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
 
                     early_metric = early_result[metric_key]
                     early_is_worse = (
-                        early_metric < baseline_metric if direction == "maximize"
-                        else early_metric > baseline_metric
+                        early_metric < _partial_baseline_metric if direction == "maximize"
+                        else early_metric > _partial_baseline_metric
                     )
                     if early_is_worse:
-                        print(f"  {var_id} early-stop: {early_metric:.3f} worse than baseline {baseline_metric:.3f}, skipping remaining dates", file=sys.stderr)
+                        print(f"  {var_id} early-stop: {early_metric:.3f} worse than baseline {_partial_baseline_metric:.3f}, skipping remaining dates", file=sys.stderr)
                         results.append({
                             "variation": var_id,
                             "metric": early_metric,
