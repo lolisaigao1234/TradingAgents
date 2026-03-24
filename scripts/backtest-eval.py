@@ -112,13 +112,88 @@ def binomial_pvalue(k, n, p0=0.5):
     return sum(math.comb(n, i) * p0**i * (1 - p0)**(n - i) for i in range(k, n + 1))
 
 
+def _betacf(a, b, x):
+    """Continued fraction for incomplete beta function (Numerical Recipes)."""
+    FPMIN = 1e-30
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, 200):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 1e-12:
+            break
+    return h
+
+
+def _betainc_reg(a, b, x):
+    """Regularized incomplete beta function I_x(a, b).
+
+    Uses the continued fraction representation from Numerical Recipes.
+    Accurate to ~1e-10 for typical binomial CI parameters.
+    """
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    # Use symmetry relation when x > (a+1)/(a+b+2) for better convergence
+    if x > (a + 1.0) / (a + b + 2.0):
+        return 1.0 - _betainc_reg(b, a, 1.0 - x)
+    lbeta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(a * math.log(x) + b * math.log(1.0 - x) - lbeta)
+    return front * _betacf(a, b, x) / a
+
+
+def _beta_ppf_bisect(p, a, b):
+    """Inverse of the regularized incomplete beta function via bisection."""
+    lo, hi = 0.0, 1.0
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if _betainc_reg(a, b, mid) < p:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-12:
+            break
+    return (lo + hi) / 2.0
+
+
 def clopper_pearson_ci(k, n, alpha=0.05):
     """Clopper-Pearson exact confidence interval for binomial proportion.
 
-    Uses the relationship between binomial and beta distributions,
-    computed via the incomplete beta function regularized form.
-    Pure-Python: uses the normal approximation when scipy is unavailable.
+    Uses scipy.stats.beta.ppf when available, otherwise falls back to a
+    pure-Python implementation using the regularized incomplete beta function
+    with bisection search.
+
+    Returns (0.0, 1.0) when n==0 (trivially uninformative).
     """
+    if n == 0:
+        return 0.0, 1.0
+
     try:
         from scipy.stats import beta as beta_dist
         if k == 0:
@@ -131,13 +206,16 @@ def clopper_pearson_ci(k, n, alpha=0.05):
             hi = beta_dist.ppf(1 - alpha / 2, k + 1, n - k)
         return lo, hi
     except ImportError:
-        # Wilson score interval as fallback (good approximation)
-        p_hat = k / n if n > 0 else 0.0
-        z = 1.96  # z for 95% CI
-        denom = 1 + z**2 / n
-        centre = (p_hat + z**2 / (2 * n)) / denom
-        margin = z * math.sqrt((p_hat * (1 - p_hat) + z**2 / (4 * n)) / n) / denom
-        return max(0.0, centre - margin), min(1.0, centre + margin)
+        # Pure-Python Clopper-Pearson via regularized incomplete beta bisection
+        if k == 0:
+            lo = 0.0
+        else:
+            lo = _beta_ppf_bisect(alpha / 2, k, n - k + 1)
+        if k == n:
+            hi = 1.0
+        else:
+            hi = _beta_ppf_bisect(1 - alpha / 2, k + 1, n - k)
+        return lo, hi
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +237,15 @@ def generate_trading_dates(ticker, n_dates, date_range=None, horizon=5):
         start_str = start_dt.strftime("%Y-%m-%d")
         end_str = end_dt.strftime("%Y-%m-%d")
 
+    # yfinance end parameter is exclusive (like Python range), so add 1 day
+    # to include the end date itself in the download window.
+    end_dt_adj = datetime.strptime(end_str, "%Y-%m-%d") + timedelta(days=1)
+    end_str_adj = end_dt_adj.strftime("%Y-%m-%d")
+
     data = yf.download(
         ticker,
         start=start_str,
-        end=end_str,
+        end=end_str_adj,
         progress=False,
         auto_adjust=True,
         multi_level_index=False,
@@ -408,6 +491,8 @@ def main():
                         help="Output results as JSON for machine consumption")
     parser.add_argument("--workers", type=int, default=1,
                         help="Number of multiprocessing workers (default: 1)")
+    parser.add_argument("--list-dates", action="store_true",
+                        help="Resolve and print the date list as JSON, then exit (no eval)")
     args = parser.parse_args()
 
     # --- CLI validation ---
@@ -454,6 +539,11 @@ def main():
             parser.error(f"Could not generate trading dates for {ticker}")
     else:
         parser.error("Either --dates or --n-dates is required")
+
+    # --list-dates: print resolved dates and exit (no eval run)
+    if args.list_dates:
+        print(json.dumps(dates))
+        return
 
     verbose = args.verbose
 
@@ -541,7 +631,7 @@ def main():
         effect_size = accuracy - 0.5  # simple effect size vs chance
     else:
         p_value = 1.0
-        ci_lower, ci_upper = 0.0, 0.0
+        ci_lower, ci_upper = None, None
         significant = False
         effect_size = 0.0
 
@@ -554,8 +644,8 @@ def main():
             "accuracy": round(accuracy, 4),
             "weighted_accuracy": round(weighted_accuracy, 4),
             "p_value": round(p_value, 6),
-            "ci_lower": round(ci_lower, 4),
-            "ci_upper": round(ci_upper, 4),
+            "ci_lower": round(ci_lower, 4) if ci_lower is not None else None,
+            "ci_upper": round(ci_upper, 4) if ci_upper is not None else None,
             "effect_size": round(effect_size, 4),
             "significant": significant,
             "details": details,
@@ -564,6 +654,7 @@ def main():
     else:
         # TSV output (backward compatible + new stat columns)
         details_str = " ".join(details) if details else "none"
+        ci_str = f"{ci_lower:.3f}-{ci_upper:.3f}" if ci_lower is not None else "NA-NA"
         print("\t".join([
             ticker,
             str(len(dates)),
@@ -571,7 +662,7 @@ def main():
             f"{accuracy:.3f}",
             f"{weighted_accuracy:.3f}",
             f"{p_value:.4f}",
-            f"{ci_lower:.3f}-{ci_upper:.3f}",
+            ci_str,
             "yes" if significant else "no",
             details_str,
         ]))

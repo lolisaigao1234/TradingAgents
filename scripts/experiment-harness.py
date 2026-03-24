@@ -218,10 +218,18 @@ def _manifest_hash(manifest: dict) -> str:
 def _cache_path(manifest: dict) -> str:
     ticker = manifest.get("eval_args", "").split("--ticker")[-1].split()[0].strip() if "--ticker" in manifest.get("eval_args", "") else "unknown"
     n_dates = manifest.get("n_dates", "manual")
-    mhash = _manifest_hash(manifest)
+    # Include manifest hash + eval script content hash so changes to
+    # evaluation logic invalidate the cache.
+    h = hashlib.sha256()
+    h.update(_manifest_hash(manifest).encode())
+    eval_script_path = os.path.join(_PROJECT_ROOT, manifest.get("eval_script", ""))
+    if os.path.exists(eval_script_path):
+        with open(eval_script_path, "rb") as f:
+            h.update(f.read())
+    combined_hash = h.hexdigest()[:16]
     cache_dir = os.path.join(_PROJECT_ROOT, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"baseline-{ticker}-{n_dates}-{mhash}.json")
+    return os.path.join(cache_dir, f"baseline-{ticker}-{n_dates}-{combined_hash}.json")
 
 
 def load_cached_baseline(manifest: dict):
@@ -280,9 +288,10 @@ def run_backtest(script: str, args_str: str, cwd: str, timeout: int) -> dict:
             return {
                 "directional_accuracy": data.get("accuracy", 0.0),
                 "weighted_accuracy": data.get("weighted_accuracy", 0.0),
+                "n_scored": data.get("n_scored", 0),
                 "p_value": data.get("p_value", 1.0),
-                "ci_lower": data.get("ci_lower", 0.0),
-                "ci_upper": data.get("ci_upper", 0.0),
+                "ci_lower": data.get("ci_lower"),
+                "ci_upper": data.get("ci_upper"),
                 "significant": data.get("significant", False),
                 "details": " ".join(data.get("details", [])),
                 "raw": stdout,
@@ -333,6 +342,23 @@ def _extract_dates(eval_args: str) -> list[str]:
     return []
 
 
+def _resolve_dates(eval_script: str, eval_args: str, cwd: str) -> list[str]:
+    """Resolve the actual date list by calling backtest-eval.py --list-dates.
+
+    Works for both --dates and --n-dates manifests. Returns [] on failure.
+    """
+    cmd = [sys.executable, eval_script] + shlex.split(eval_args) + ["--list-dates"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        pass
+    return []
+
+
 def _replace_dates(eval_args: str, dates: list[str]) -> str:
     """Return eval_args with the --dates value replaced."""
     parts = shlex.split(eval_args)
@@ -346,6 +372,26 @@ def _replace_dates(eval_args: str, dates: list[str]) -> str:
         else:
             result.append(parts[i])
             i += 1
+    return " ".join(shlex.quote(p) for p in result)
+
+
+def _build_dates_args(eval_args: str, dates: list[str]) -> str:
+    """Build eval_args using explicit --dates, stripping --n-dates/--date-range.
+
+    For early-stop we need to run on a specific subset of resolved dates,
+    so we replace any date-generation args with a concrete --dates list.
+    """
+    parts = shlex.split(eval_args)
+    result = []
+    i = 0
+    skip_next = {"--dates", "--n-dates", "--date-range"}
+    while i < len(parts):
+        if parts[i] in skip_next and i + 1 < len(parts):
+            i += 2  # skip flag + value
+        else:
+            result.append(parts[i])
+            i += 1
+    result.extend(["--dates", ",".join(dates)])
     return " ".join(shlex.quote(p) for p in result)
 
 
@@ -494,8 +540,9 @@ def check_kill_gates(kill_gates: dict, var_result: dict, baseline_metric: float)
 
     min_ceiling = kill_gates.get("min_ceiling")
     if min_ceiling is not None:
-        ci_upper = var_result.get("ci_upper", 1.0)
-        if ci_upper < min_ceiling:
+        ci_upper = var_result.get("ci_upper")
+        # Skip min_ceiling check when CI is unavailable (e.g. n_scored==0)
+        if ci_upper is not None and ci_upper < min_ceiling:
             return f"kill_gate: CI upper bound ({ci_upper:.3f}) < min_ceiling ({min_ceiling})"
 
     return None
@@ -575,13 +622,19 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
         })
 
         # Pre-compute partial baseline for early-stop comparison (Issue #9)
+        # Resolve dates via --list-dates (works for both --dates and --n-dates)
         _partial_baseline_metric = None
-        all_dates = _extract_dates(eval_args)
+        all_dates = _resolve_dates(eval_script, eval_args, worktree_path)
+        if not all_dates:
+            # Fallback to parsing --dates from args directly
+            all_dates = _extract_dates(eval_args)
         if not dry_run and early_stop_after and 0 < early_stop_after < len(all_dates):
             early_dates = all_dates[:early_stop_after]
-            early_eval_args = _replace_dates(eval_args, early_dates)
+            # Construct --dates with the first N resolved dates (replaces any
+            # --n-dates/--date-range args so early-stop runs on exact dates)
+            early_args = _build_dates_args(eval_args, early_dates)
             print(f"  Computing baseline on first {early_stop_after} dates for early-stop comparison...", file=sys.stderr)
-            _partial_bl = run_eval(eval_script, early_eval_args, worktree_path, timeout)
+            _partial_bl = run_backtest(eval_script, early_args, worktree_path, timeout)
             if _partial_bl is not None:
                 _partial_baseline_metric = _partial_bl[metric_key]
                 print(f"  Partial baseline {metric_key}: {_partial_baseline_metric:.3f}", file=sys.stderr)
@@ -659,7 +712,7 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 # Issue #9: early_stop_after — run first N dates, bail if worse
                 if _partial_baseline_metric is not None and early_stop_after and 0 < early_stop_after < len(all_dates):
                     early_dates = all_dates[:early_stop_after]
-                    early_eval_args = _replace_dates(eval_args, early_dates)
+                    early_eval_args = _build_dates_args(eval_args, early_dates)
                     print(f"  Early-stop check: evaluating first {early_stop_after} dates...", file=sys.stderr)
                     early_result = run_eval(eval_script, early_eval_args, worktree_path, timeout)
 
@@ -719,6 +772,18 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                         "description": kill_reason,
                     })
                     continue
+
+            # Mark as invalid if no dates were actually scored
+            n_scored = var_result.get("n_scored", -1)
+            if not dry_run and n_scored == 0:
+                results.append({
+                    "variation": var_id,
+                    "metric": var_metric,
+                    "status": "invalid_eval",
+                    "description": f"n_scored=0: {description}",
+                })
+                print(f"  {var_id} no dates scored (n_scored=0), marking invalid_eval", file=sys.stderr)
+                continue
 
             # Significance-based keep/discard
             is_better = (
