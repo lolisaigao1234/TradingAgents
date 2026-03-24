@@ -588,6 +588,15 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
     # Step 6: Print ranked table
     print_results_table(results)
 
+    # Step 7: Print cross-validate command hint
+    branch_name = f"evolve/{experiment_id}-{os.getpid()}"
+    manifest_path = manifest.get("_manifest_path", "experiments/nvda-market.yaml")
+    print(f"\n  To cross-validate results:", file=sys.stderr)
+    print(f"    python scripts/cross-validate.py \\", file=sys.stderr)
+    print(f"      --results-tsv {tsv_path} \\", file=sys.stderr)
+    print(f"      --branch {branch_name} \\", file=sys.stderr)
+    print(f"      --manifest {manifest_path}", file=sys.stderr)
+
     return results
 
 
@@ -614,6 +623,7 @@ def main():
     args = parser.parse_args()
 
     manifest = load_manifest(args.manifest)
+    manifest["_manifest_path"] = args.manifest
     results = run_experiment(manifest, args.max_variations, args.dry_run)
 
     # Exit with non-zero if no candidates found
