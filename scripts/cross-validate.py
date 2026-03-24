@@ -421,17 +421,15 @@ def compute_verdict(comparison: dict, issues_codex: list, issues_claude: list) -
     if not issues_codex and not issues_claude:
         return "APPROVE"
 
-    # Any PARTIAL_AGREE (severity mismatch) → NEEDS_ATTENTION
-    # Check this BEFORE the CRITICAL check: if agents disagree on severity
-    # (one says CRITICAL, the other doesn't), it needs human judgment.
-    for a in comparison["agreed"]:
-        if a["match"] == "PARTIAL_AGREE":
-            return "NEEDS_ATTENTION"
-
-    # Any CRITICAL issue fully agreed by both agents → REJECT
+    # Any CRITICAL issue fully agreed by both agents → REJECT (strongest signal)
     for a in comparison["agreed"]:
         if a["issue_a"]["severity"] == "CRITICAL" and a["issue_b"]["severity"] == "CRITICAL":
             return "REJECT"
+
+    # Any PARTIAL_AGREE (severity mismatch) → NEEDS_ATTENTION
+    for a in comparison["agreed"]:
+        if a["match"] == "PARTIAL_AGREE":
+            return "NEEDS_ATTENTION"
 
     # Any disagreements → NEEDS_ATTENTION
     if comparison["only_a"] or comparison["only_b"]:
