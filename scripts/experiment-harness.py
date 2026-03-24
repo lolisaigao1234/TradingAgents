@@ -11,9 +11,9 @@ Orchestrates the experiment loop:
   7. Clean up worktree
 
 Usage:
-    python scripts/experiment-harness.py --manifest experiments/nvda-fundamentals.yaml
-    python scripts/experiment-harness.py --manifest experiments/nvda-fundamentals.yaml --dry-run
-    python scripts/experiment-harness.py --manifest experiments/nvda-fundamentals.yaml --max-variations 3
+    python scripts/experiment-harness.py --manifest experiments/nvda-market.yaml
+    python scripts/experiment-harness.py --manifest experiments/nvda-market.yaml --dry-run
+    python scripts/experiment-harness.py --manifest experiments/nvda-market.yaml --max-variations 3
 """
 
 import argparse
@@ -22,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import textwrap
-import time
 import yaml
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +53,34 @@ def load_manifest(path: str) -> dict:
         print(f"Error: manifest missing required keys: {missing}", file=sys.stderr)
         sys.exit(1)
 
+    # --- Issue #8: Strong manifest validation ---
+    if manifest["direction"] not in ("maximize", "minimize"):
+        print(f"Error: direction must be 'maximize' or 'minimize', got '{manifest['direction']}'", file=sys.stderr)
+        sys.exit(1)
+
+    if not manifest["allowed_files"]:
+        print("Error: allowed_files must not be empty", file=sys.stderr)
+        sys.exit(1)
+
+    for af in manifest["allowed_files"]:
+        # Reject symlinks in allowed_files paths
+        full_path = os.path.join(_PROJECT_ROOT, af)
+        if os.path.islink(full_path):
+            print(f"Error: allowed_files entry is a symlink: {af}", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(full_path):
+            print(f"Error: allowed_files entry does not exist: {af}", file=sys.stderr)
+            sys.exit(1)
+
+    timeout = manifest.get("timeout_per_run", 600)
+    if timeout <= 0:
+        print(f"Error: timeout_per_run must be > 0, got {timeout}", file=sys.stderr)
+        sys.exit(1)
+
+    if manifest["max_variations"] <= 0:
+        print(f"Error: max_variations must be > 0, got {manifest['max_variations']}", file=sys.stderr)
+        sys.exit(1)
+
     # Defaults
     manifest.setdefault("timeout_per_run", 600)
     manifest.setdefault("early_stop_after", 2)
@@ -62,7 +89,7 @@ def load_manifest(path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Git worktree helpers
+# Git helpers  (Issue #6: all git ops go through _run_git, checks returncode)
 # ---------------------------------------------------------------------------
 
 def _run_git(*args, cwd=None):
@@ -76,10 +103,15 @@ def _run_git(*args, cwd=None):
     return result.stdout.strip()
 
 
+# ---------------------------------------------------------------------------
+# Git worktree helpers
+# ---------------------------------------------------------------------------
+
 def create_worktree(experiment_id: str) -> str:
     """Create an isolated git worktree. Returns the worktree path."""
-    worktree_path = f"/tmp/evolve-{experiment_id}"
-    branch_name = f"evolve/{experiment_id}"
+    # Issue #7: Add PID to worktree path to avoid concurrent run conflicts
+    worktree_path = f"/tmp/evolve-{experiment_id}-{os.getpid()}"
+    branch_name = f"evolve/{experiment_id}-{os.getpid()}"
 
     # Clean up stale worktree if it exists
     if os.path.exists(worktree_path):
@@ -102,7 +134,7 @@ def create_worktree(experiment_id: str) -> str:
 
 def cleanup_worktree(experiment_id: str, worktree_path: str):
     """Remove worktree and its branch."""
-    branch_name = f"evolve/{experiment_id}"
+    branch_name = f"evolve/{experiment_id}-{os.getpid()}"
     try:
         _run_git("worktree", "remove", "--force", worktree_path)
     except RuntimeError:
@@ -115,54 +147,63 @@ def cleanup_worktree(experiment_id: str, worktree_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Whitelist enforcer
+# Whitelist enforcer  (Issue #1: staged+unstaged+untracked, reject symlinks)
 # ---------------------------------------------------------------------------
 
 def check_whitelist(allowed_files: list[str], cwd: str) -> list[str]:
-    """Return list of changed files that are NOT in the allowed list."""
-    output = subprocess.run(
-        ["git", "diff", "--name-only"],
-        capture_output=True, text=True, cwd=cwd,
-    ).stdout.strip()
-    if not output:
-        return []
-    changed = output.split("\n")
-    return [f for f in changed if f not in allowed_files]
+    """Return list of changed files that are NOT in the allowed list.
+
+    Checks staged+unstaged changes (vs HEAD) and untracked files.
+    Also rejects symlinks in allowed_files paths within the worktree.
+    """
+    violations = []
+
+    # Check for symlinks in allowed_files within the worktree
+    for af in allowed_files:
+        full_path = os.path.join(cwd, af)
+        if os.path.islink(full_path):
+            violations.append(f"{af} (symlink)")
+
+    # Staged + unstaged changes vs HEAD
+    tracked_output = _run_git("diff", "--name-only", "HEAD", cwd=cwd)
+    tracked_changed = tracked_output.split("\n") if tracked_output else []
+
+    # Untracked files
+    untracked_output = _run_git("ls-files", "--others", "--exclude-standard", cwd=cwd)
+    untracked_files = untracked_output.split("\n") if untracked_output else []
+
+    all_changed = tracked_changed + untracked_files
+    for f in all_changed:
+        if f and f not in allowed_files:
+            violations.append(f)
+
+    return violations
 
 
 # ---------------------------------------------------------------------------
-# Backtest evaluation
+# Backtest evaluation  (Issue #10: no shell=True, use list args)
 # ---------------------------------------------------------------------------
 
 def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
     """Run backtest-eval.py and parse TSV output.
 
     Returns dict with keys: directional_accuracy, weighted_accuracy, details, raw.
+    On failure returns None.
     """
-    cmd = f"python {eval_script} {eval_args}"
+    cmd = ["python", eval_script] + eval_args.split()
     result = subprocess.run(
-        cmd, shell=True, capture_output=True, text=True,
+        cmd, capture_output=True, text=True,
         cwd=cwd, timeout=timeout,
     )
 
     if result.returncode != 0:
-        return {
-            "directional_accuracy": 0.0,
-            "weighted_accuracy": 0.0,
-            "details": f"EVAL_FAILED: {result.stderr.strip()[:200]}",
-            "raw": result.stderr.strip(),
-        }
+        return None
 
     # Parse TSV: ticker  n_dates  n_scored  accuracy  weighted_accuracy  details
     line = result.stdout.strip().split("\n")[-1]  # last line is the TSV
     parts = line.split("\t")
     if len(parts) < 5:
-        return {
-            "directional_accuracy": 0.0,
-            "weighted_accuracy": 0.0,
-            "details": f"PARSE_ERROR: {line[:200]}",
-            "raw": result.stdout.strip(),
-        }
+        return None
 
     return {
         "directional_accuracy": float(parts[3]),
@@ -173,7 +214,36 @@ def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code variation generator
+# Early-stop date helpers  (Issue #9)
+# ---------------------------------------------------------------------------
+
+def _extract_dates(eval_args: str) -> list[str]:
+    """Extract the comma-separated dates list from eval_args string."""
+    parts = eval_args.split()
+    for i, p in enumerate(parts):
+        if p == "--dates" and i + 1 < len(parts):
+            return [d.strip() for d in parts[i + 1].split(",") if d.strip()]
+    return []
+
+
+def _replace_dates(eval_args: str, dates: list[str]) -> str:
+    """Return eval_args with the --dates value replaced."""
+    parts = eval_args.split()
+    result = []
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--dates" and i + 1 < len(parts):
+            result.append("--dates")
+            result.append(",".join(dates))
+            i += 2
+        else:
+            result.append(parts[i])
+            i += 1
+    return " ".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code variation generator  (Issue #10: no shell=True)
 # ---------------------------------------------------------------------------
 
 _VARIATION_HINTS = [
@@ -265,8 +335,10 @@ def generate_variation(
 
 
 # ---------------------------------------------------------------------------
-# Results logging
+# Results logging  (Issue #10: standardized statuses)
 # ---------------------------------------------------------------------------
+
+# Valid statuses: 'baseline', 'keep', 'discard', 'crash', 'whitelist_violation'
 
 def write_results_tsv(results: list[dict], output_path: str):
     """Write results to a TSV file."""
@@ -284,13 +356,13 @@ def print_results_table(results: list[dict]):
     print("\n" + "=" * 72, file=sys.stderr)
     print("  EXPERIMENT RESULTS (ranked by metric)", file=sys.stderr)
     print("=" * 72, file=sys.stderr)
-    print(f"  {'Rank':<6}{'Variation':<14}{'Metric':<10}{'Status':<10}{'Description'}", file=sys.stderr)
+    print(f"  {'Rank':<6}{'Variation':<14}{'Metric':<10}{'Status':<20}{'Description'}", file=sys.stderr)
     print("-" * 72, file=sys.stderr)
 
     for i, r in enumerate(ranked, 1):
-        marker = " *" if r["status"] == "candidate" else ""
+        marker = " *" if r["status"] == "keep" and r["variation"] != "baseline" else ""
         print(
-            f"  {i:<6}{r['variation']:<14}{r['metric']:<10.3f}{r['status']:<10}{r['description'][:40]}{marker}",
+            f"  {i:<6}{r['variation']:<14}{r['metric']:<10.3f}{r['status']:<20}{r['description'][:40]}{marker}",
             file=sys.stderr,
         )
 
@@ -322,12 +394,17 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
     print(f"  Eval: {eval_script} {eval_args}", file=sys.stderr)
     print(f"  Metric: {metric_key} ({direction})", file=sys.stderr)
     print(f"  Variations: {n_variations} | Timeout: {timeout}s", file=sys.stderr)
+    print(f"  Early stop after: {early_stop_after} dates", file=sys.stderr)
     print(f"{'#' * 60}\n", file=sys.stderr)
 
     # Step 1: Create worktree
     worktree_path = create_worktree(experiment_id)
 
     try:
+        # Issue #2: Capture baseline SHA for resetting between variations
+        baseline_sha = _run_git("rev-parse", "HEAD", cwd=worktree_path)
+        print(f"  Baseline SHA: {baseline_sha[:12]}", file=sys.stderr)
+
         # Step 2: Run baseline
         print("  Running baseline evaluation...", file=sys.stderr)
         if dry_run:
@@ -335,13 +412,18 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
         else:
             baseline_result = run_eval(eval_script, eval_args, worktree_path, timeout)
 
+        # Issue #5: If baseline eval fails, abort entire experiment
+        if baseline_result is None:
+            print("  FATAL: Baseline evaluation failed. Aborting experiment.", file=sys.stderr)
+            sys.exit(1)
+
         baseline_metric = baseline_result[metric_key]
         print(f"  Baseline {metric_key}: {baseline_metric:.3f}", file=sys.stderr)
 
         results.append({
             "variation": "baseline",
             "metric": baseline_metric,
-            "status": "keep",
+            "status": "baseline",
             "description": "unchanged prompts",
         })
 
@@ -350,11 +432,9 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
             var_id = f"var-{var_num:03d}"
             print(f"\n  --- Variation {var_num}/{n_variations} ({var_id}) ---", file=sys.stderr)
 
-            # Reset worktree to clean state
-            subprocess.run(
-                ["git", "checkout", "--", "."],
-                capture_output=True, cwd=worktree_path,
-            )
+            # Issue #2/#3: Hard reset to baseline SHA + clean untracked files
+            _run_git("reset", "--hard", baseline_sha, cwd=worktree_path)
+            _run_git("clean", "-fdx", cwd=worktree_path)
 
             # Generate variation via Claude Code
             description = generate_variation(
@@ -365,45 +445,87 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 results.append({
                     "variation": var_id,
                     "metric": 0.0,
-                    "status": "discard",
+                    "status": "crash",
                     "description": "GENERATION_FAILED",
                 })
                 continue
 
-            # Whitelist check
+            # Whitelist check (Issue #1)
             violations = check_whitelist(allowed_files, worktree_path)
             if violations:
                 print(f"  WHITELIST_VIOLATION: {violations}", file=sys.stderr)
-                subprocess.run(
-                    ["git", "checkout", "--", "."],
-                    capture_output=True, cwd=worktree_path,
-                )
+                # Reset to abort this variation
+                _run_git("reset", "--hard", baseline_sha, cwd=worktree_path)
+                _run_git("clean", "-fdx", cwd=worktree_path)
                 results.append({
                     "variation": var_id,
                     "metric": 0.0,
-                    "status": "discard",
+                    "status": "whitelist_violation",
                     "description": f"WHITELIST_VIOLATION: {violations}",
                 })
                 continue
 
-            # Commit the variation
-            subprocess.run(
-                ["git", "add"] + allowed_files,
-                capture_output=True, cwd=worktree_path,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", f"{var_id}: {description}"],
-                capture_output=True, cwd=worktree_path,
-            )
+            # Commit the variation (Issue #6: use _run_git)
+            _run_git("add", *allowed_files, cwd=worktree_path)
+            _run_git("commit", "-m", f"{var_id}: {description}", cwd=worktree_path)
 
             # Evaluate
             print(f"  Evaluating {var_id}...", file=sys.stderr)
             if dry_run:
                 var_result = {"directional_accuracy": 0.0, "weighted_accuracy": 0.0, "details": "[dry-run]"}
+                var_metric = 0.0
             else:
+                # Issue #9: early_stop_after — run first N dates, bail if worse
+                all_dates = _extract_dates(eval_args)
+                early_stopped = False
+
+                if early_stop_after and 0 < early_stop_after < len(all_dates):
+                    early_dates = all_dates[:early_stop_after]
+                    early_eval_args = _replace_dates(eval_args, early_dates)
+                    print(f"  Early-stop check: evaluating first {early_stop_after} dates...", file=sys.stderr)
+                    early_result = run_eval(eval_script, early_eval_args, worktree_path, timeout)
+
+                    if early_result is None:
+                        print(f"  {var_id} EVAL CRASHED during early-stop check", file=sys.stderr)
+                        results.append({
+                            "variation": var_id,
+                            "metric": 0.0,
+                            "status": "crash",
+                            "description": f"EVAL_CRASHED: {description}",
+                        })
+                        continue
+
+                    early_metric = early_result[metric_key]
+                    early_is_worse = (
+                        early_metric < baseline_metric if direction == "maximize"
+                        else early_metric > baseline_metric
+                    )
+                    if early_is_worse:
+                        print(f"  {var_id} early-stop: {early_metric:.3f} worse than baseline {baseline_metric:.3f}, skipping remaining dates", file=sys.stderr)
+                        results.append({
+                            "variation": var_id,
+                            "metric": early_metric,
+                            "status": "discard",
+                            "description": f"early_stopped: {description}",
+                        })
+                        continue
+
+                # Full evaluation
                 var_result = run_eval(eval_script, eval_args, worktree_path, timeout)
 
-            var_metric = var_result[metric_key]
+                # Issue #5: Variation failures → status='crash' with error message
+                if var_result is None:
+                    print(f"  {var_id} EVAL CRASHED", file=sys.stderr)
+                    results.append({
+                        "variation": var_id,
+                        "metric": 0.0,
+                        "status": "crash",
+                        "description": f"EVAL_CRASHED: {description}",
+                    })
+                    continue
+
+                var_metric = var_result[metric_key]
+
             print(f"  {var_id} {metric_key}: {var_metric:.3f}", file=sys.stderr)
 
             # Determine status
@@ -411,7 +533,7 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 var_metric > baseline_metric if direction == "maximize"
                 else var_metric < baseline_metric
             )
-            status = "candidate" if is_better else "discard"
+            status = "keep" if is_better else "discard"
 
             results.append({
                 "variation": var_id,
@@ -466,7 +588,7 @@ def main():
     results = run_experiment(manifest, args.max_variations, args.dry_run)
 
     # Exit with non-zero if no candidates found
-    candidates = [r for r in results if r["status"] == "candidate"]
+    candidates = [r for r in results if r["status"] == "keep"]
     if not candidates:
         print("  No improvements found.", file=sys.stderr)
         sys.exit(1)

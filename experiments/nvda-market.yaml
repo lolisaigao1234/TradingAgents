@@ -1,8 +1,8 @@
 experiment:
-  id: evolve-fundamentals-001
+  id: evolve-market-001
   domain: tradingagents
   allowed_files:
-    - tradingagents/agents/analysts/fundamentals_analyst.py
+    - tradingagents/agents/analysts/market_analyst.py
   eval_script: scripts/backtest-eval.py
   eval_args: "--ticker NVDA --dates 2026-03-10,2026-03-14,2026-03-17"
   metric: directional_accuracy
