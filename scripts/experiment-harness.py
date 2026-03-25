@@ -227,7 +227,15 @@ def _cache_path(manifest: dict) -> str:
         with open(eval_script_path, "rb") as f:
             h.update(f.read())
     combined_hash = h.hexdigest()[:16]
-    cache_dir = os.path.join(_PROJECT_ROOT, ".cache")
+    # Cache in the MAIN repo, not the worktree (worktrees are ephemeral)
+    main_repo = subprocess.run(
+        ["git", "-C", _PROJECT_ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if main_repo and os.path.isdir(main_repo):
+        cache_dir = os.path.join(os.path.dirname(main_repo), ".cache")
+    else:
+        cache_dir = os.path.join(_PROJECT_ROOT, ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"baseline-{ticker}-{n_dates}-{combined_hash}.json")
 
