@@ -17,6 +17,8 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -85,6 +87,11 @@ def load_manifest(path: str) -> dict:
     # Defaults
     manifest.setdefault("timeout_per_run", 600)
     manifest.setdefault("early_stop_after", 2)
+    manifest.setdefault("n_dates", None)
+    manifest.setdefault("date_range", None)
+    manifest.setdefault("workers", 1)
+    manifest.setdefault("significance_alpha", 0.05)
+    manifest.setdefault("kill_gates", None)
 
     return manifest
 
@@ -190,16 +197,75 @@ def check_whitelist(allowed_files: list[str], cwd: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Baseline caching
+# ---------------------------------------------------------------------------
+
+def _manifest_hash(manifest: dict) -> str:
+    """Compute a stable hash of the manifest + relevant source files."""
+    h = hashlib.sha256()
+    # Hash manifest content (excluding internal keys)
+    clean = {k: v for k, v in sorted(manifest.items()) if not k.startswith("_")}
+    h.update(json.dumps(clean, sort_keys=True, default=str).encode())
+    # Hash content of allowed_files
+    for af in manifest.get("allowed_files", []):
+        full_path = os.path.join(_PROJECT_ROOT, af)
+        if os.path.exists(full_path):
+            with open(full_path, "rb") as f:
+                h.update(f.read())
+    return h.hexdigest()[:16]
+
+
+def _cache_path(manifest: dict) -> str:
+    ticker = manifest.get("eval_args", "").split("--ticker")[-1].split()[0].strip() if "--ticker" in manifest.get("eval_args", "") else "unknown"
+    n_dates = manifest.get("n_dates", "manual")
+    # Include manifest hash + eval script content hash so changes to
+    # evaluation logic invalidate the cache.
+    h = hashlib.sha256()
+    h.update(_manifest_hash(manifest).encode())
+    eval_script_path = os.path.join(_PROJECT_ROOT, manifest.get("eval_script", ""))
+    if os.path.exists(eval_script_path):
+        with open(eval_script_path, "rb") as f:
+            h.update(f.read())
+    combined_hash = h.hexdigest()[:16]
+    cache_dir = os.path.join(_PROJECT_ROOT, ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"baseline-{ticker}-{n_dates}-{combined_hash}.json")
+
+
+def load_cached_baseline(manifest: dict):
+    """Load cached baseline result if it exists and config matches."""
+    path = _cache_path(manifest)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
+
+
+def save_baseline_cache(manifest: dict, result: dict):
+    """Save baseline evaluation result to cache."""
+    path = _cache_path(manifest)
+    try:
+        with open(path, "w") as f:
+            json.dump(result, f, indent=2)
+    except OSError as e:
+        print(f"  Warning: could not write baseline cache: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Backtest evaluation  (Issue #10: no shell=True, use list args)
 # ---------------------------------------------------------------------------
 
-def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
-    """Run backtest-eval.py and parse TSV output.
+def run_backtest(script: str, args_str: str, cwd: str, timeout: int) -> dict:
+    """Run backtest-eval.py and parse output (JSON or TSV).
 
-    Returns dict with keys: directional_accuracy, weighted_accuracy, details, raw.
+    Returns dict with keys: directional_accuracy, weighted_accuracy, details, raw,
+    and optionally p_value, ci_lower, ci_upper, significant.
     On failure returns None.
     """
-    cmd = [sys.executable, eval_script] + shlex.split(eval_args)
+    cmd = [sys.executable, script] + shlex.split(args_str)
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
@@ -211,18 +277,64 @@ def run_eval(eval_script: str, eval_args: str, cwd: str, timeout: int) -> dict:
     if result.returncode != 0:
         return None
 
-    # Parse TSV: ticker  n_dates  n_scored  accuracy  weighted_accuracy  details
-    line = result.stdout.strip().split("\n")[-1]  # last line is the TSV
+    stdout = result.stdout.strip()
+    if not stdout:
+        return None
+
+    # Try JSON first (if --output-json was used)
+    if stdout.startswith("{"):
+        try:
+            data = json.loads(stdout)
+            return {
+                "directional_accuracy": data.get("accuracy", 0.0),
+                "weighted_accuracy": data.get("weighted_accuracy", 0.0),
+                "n_scored": data.get("n_scored", 0),
+                "p_value": data.get("p_value", 1.0),
+                "ci_lower": data.get("ci_lower"),
+                "ci_upper": data.get("ci_upper"),
+                "significant": data.get("significant", False),
+                "details": " ".join(data.get("details", [])),
+                "raw": stdout,
+            }
+        except json.JSONDecodeError:
+            pass
+
+    # Fall back to TSV parsing
+    line = stdout.split("\n")[-1]
     parts = line.split("\t")
     if len(parts) < 5:
         return None
 
-    return {
+    parsed = {
         "directional_accuracy": float(parts[3]),
         "weighted_accuracy": float(parts[4]),
         "details": parts[5] if len(parts) > 5 else "",
-        "raw": result.stdout.strip(),
+        "raw": stdout,
     }
+    # Propagate n_scored from TSV column 2 (n_total)
+    try:
+        parsed["n_scored"] = int(parts[2])
+    except (ValueError, IndexError):
+        pass
+    # Parse extended TSV columns (p_value, CI, significant)
+    if len(parts) >= 8:
+        try:
+            parsed["p_value"] = float(parts[5])
+            ci_parts = parts[6].split("-")
+            # Handle 'NA' values in CI (emitted when n_scored==0)
+            ci_lo = ci_parts[0].strip()
+            ci_hi = ci_parts[1].strip() if len(ci_parts) > 1 else ci_lo
+            parsed["ci_lower"] = None if ci_lo == "NA" else float(ci_lo)
+            parsed["ci_upper"] = None if ci_hi == "NA" else float(ci_hi)
+            parsed["significant"] = parts[7].strip().lower() == "yes"
+            parsed["details"] = parts[8] if len(parts) > 8 else ""
+        except (ValueError, IndexError):
+            pass
+    return parsed
+
+
+# Backward-compatible alias
+run_eval = run_backtest
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +347,23 @@ def _extract_dates(eval_args: str) -> list[str]:
     for i, p in enumerate(parts):
         if p == "--dates" and i + 1 < len(parts):
             return [d.strip() for d in parts[i + 1].split(",") if d.strip()]
+    return []
+
+
+def _resolve_dates(eval_script: str, eval_args: str, cwd: str) -> list[str]:
+    """Resolve the actual date list by calling backtest-eval.py --list-dates.
+
+    Works for both --dates and --n-dates manifests. Returns [] on failure.
+    """
+    cmd = [sys.executable, eval_script] + shlex.split(eval_args) + ["--list-dates"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, cwd=cwd, timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout.strip())
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError):
+        pass
     return []
 
 
@@ -251,6 +380,26 @@ def _replace_dates(eval_args: str, dates: list[str]) -> str:
         else:
             result.append(parts[i])
             i += 1
+    return " ".join(shlex.quote(p) for p in result)
+
+
+def _build_dates_args(eval_args: str, dates: list[str]) -> str:
+    """Build eval_args using explicit --dates, stripping --n-dates/--date-range.
+
+    For early-stop we need to run on a specific subset of resolved dates,
+    so we replace any date-generation args with a concrete --dates list.
+    """
+    parts = shlex.split(eval_args)
+    result = []
+    i = 0
+    skip_next = {"--dates", "--n-dates", "--date-range"}
+    while i < len(parts):
+        if parts[i] in skip_next and i + 1 < len(parts):
+            i += 2  # skip flag + value
+        else:
+            result.append(parts[i])
+            i += 1
+    result.extend(["--dates", ",".join(dates)])
     return " ".join(shlex.quote(p) for p in result)
 
 
@@ -383,6 +532,35 @@ def print_results_table(results: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Kill gates
+# ---------------------------------------------------------------------------
+
+def check_kill_gates(kill_gates: dict, var_result: dict, baseline_metric: float) -> str | None:
+    """Check if any kill gate is triggered. Returns reason string or None."""
+    if not kill_gates:
+        return None
+
+    n_scored = var_result.get('n_scored', var_result.get('n_total', -1))
+    if n_scored == 0:
+        return None  # No scored data — cannot evaluate kill gates
+
+    accuracy = var_result.get("directional_accuracy", 0.0)
+
+    max_acc = kill_gates.get("max_accuracy_for_kill")
+    if max_acc is not None and accuracy <= max_acc and baseline_metric <= max_acc:
+        return f"kill_gate: both baseline ({baseline_metric:.3f}) and variation ({accuracy:.3f}) <= max_accuracy_for_kill ({max_acc})"
+
+    min_ceiling = kill_gates.get("min_ceiling")
+    if min_ceiling is not None:
+        ci_upper = var_result.get("ci_upper")
+        # Skip min_ceiling check when CI is unavailable (e.g. n_scored==0)
+        if ci_upper is not None and ci_upper < min_ceiling:
+            return f"kill_gate: CI upper bound ({ci_upper:.3f}) < min_ceiling ({min_ceiling})"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main experiment loop
 # ---------------------------------------------------------------------------
 
@@ -397,6 +575,8 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
     n_variations = max_variations or manifest["max_variations"]
     timeout = manifest["timeout_per_run"]
     early_stop_after = manifest["early_stop_after"]
+    significance_alpha = manifest.get("significance_alpha", 0.05)
+    kill_gates = manifest.get("kill_gates")
 
     results = []
 
@@ -407,6 +587,9 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
     print(f"  Metric: {metric_key} ({direction})", file=sys.stderr)
     print(f"  Variations: {n_variations} | Timeout: {timeout}s", file=sys.stderr)
     print(f"  Early stop after: {early_stop_after} dates", file=sys.stderr)
+    print(f"  Significance alpha: {significance_alpha}", file=sys.stderr)
+    if kill_gates:
+        print(f"  Kill gates: {kill_gates}", file=sys.stderr)
     print(f"{'#' * 60}\n", file=sys.stderr)
 
     # Step 1: Create worktree
@@ -417,20 +600,31 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
         baseline_sha = _run_git("rev-parse", "HEAD", cwd=worktree_path)
         print(f"  Baseline SHA: {baseline_sha[:12]}", file=sys.stderr)
 
-        # Step 2: Run baseline
-        print("  Running baseline evaluation...", file=sys.stderr)
-        if dry_run:
-            baseline_result = {"directional_accuracy": 0.667, "weighted_accuracy": 0.5, "details": "[dry-run]"}
+        # Step 2: Run baseline (with caching)
+        cached_baseline = load_cached_baseline(manifest)
+        if cached_baseline and not dry_run:
+            print("  Using cached baseline evaluation.", file=sys.stderr)
+            baseline_result = cached_baseline
         else:
-            baseline_result = run_eval(eval_script, eval_args, worktree_path, timeout)
+            print("  Running baseline evaluation...", file=sys.stderr)
+            if dry_run:
+                baseline_result = {"directional_accuracy": 0.667, "weighted_accuracy": 0.5, "details": "[dry-run]"}
+            else:
+                baseline_result = run_eval(eval_script, eval_args, worktree_path, timeout)
 
         # Issue #5: If baseline eval fails, abort entire experiment
         if baseline_result is None:
             print("  FATAL: Baseline evaluation failed. Aborting experiment.", file=sys.stderr)
             sys.exit(1)
 
+        # Cache the baseline result
+        if not dry_run and not cached_baseline:
+            save_baseline_cache(manifest, baseline_result)
+
         baseline_metric = baseline_result[metric_key]
         print(f"  Baseline {metric_key}: {baseline_metric:.3f}", file=sys.stderr)
+        if "p_value" in baseline_result:
+            print(f"  Baseline p-value: {baseline_result['p_value']:.4f}", file=sys.stderr)
 
         results.append({
             "variation": "baseline",
@@ -440,13 +634,19 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
         })
 
         # Pre-compute partial baseline for early-stop comparison (Issue #9)
+        # Resolve dates via --list-dates (works for both --dates and --n-dates)
         _partial_baseline_metric = None
-        all_dates = _extract_dates(eval_args)
+        all_dates = _resolve_dates(eval_script, eval_args, worktree_path)
+        if not all_dates:
+            # Fallback to parsing --dates from args directly
+            all_dates = _extract_dates(eval_args)
         if not dry_run and early_stop_after and 0 < early_stop_after < len(all_dates):
             early_dates = all_dates[:early_stop_after]
-            early_eval_args = _replace_dates(eval_args, early_dates)
+            # Construct --dates with the first N resolved dates (replaces any
+            # --n-dates/--date-range args so early-stop runs on exact dates)
+            early_args = _build_dates_args(eval_args, early_dates)
             print(f"  Computing baseline on first {early_stop_after} dates for early-stop comparison...", file=sys.stderr)
-            _partial_bl = run_eval(eval_script, early_eval_args, worktree_path, timeout)
+            _partial_bl = run_backtest(eval_script, early_args, worktree_path, timeout)
             if _partial_bl is not None:
                 _partial_baseline_metric = _partial_bl[metric_key]
                 print(f"  Partial baseline {metric_key}: {_partial_baseline_metric:.3f}", file=sys.stderr)
@@ -454,7 +654,13 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 print("  Warning: could not compute partial baseline, early-stop disabled", file=sys.stderr)
 
         # Step 3: Generate and evaluate variations
+        killed = False
+        kill_reason = None
         for var_num in range(1, n_variations + 1):
+            if killed:
+                print(f"\n  KILLED: skipping remaining variations. Reason: {kill_reason}", file=sys.stderr)
+                break
+
             var_id = f"var-{var_num:03d}"
             print(f"\n  --- Variation {var_num}/{n_variations} ({var_id}) ---", file=sys.stderr)
 
@@ -518,7 +724,7 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 # Issue #9: early_stop_after — run first N dates, bail if worse
                 if _partial_baseline_metric is not None and early_stop_after and 0 < early_stop_after < len(all_dates):
                     early_dates = all_dates[:early_stop_after]
-                    early_eval_args = _replace_dates(eval_args, early_dates)
+                    early_eval_args = _build_dates_args(eval_args, early_dates)
                     print(f"  Early-stop check: evaluating first {early_stop_after} dates...", file=sys.stderr)
                     early_result = run_eval(eval_script, early_eval_args, worktree_path, timeout)
 
@@ -565,12 +771,45 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
 
             print(f"  {var_id} {metric_key}: {var_metric:.3f}", file=sys.stderr)
 
-            # Determine status
+            # Mark as invalid if no dates were actually scored — check BEFORE
+            # kill gates so zero-scored evals don't falsely trigger kills.
+            n_scored = var_result.get("n_scored", var_result.get("n_total", -1))
+            if not dry_run and n_scored == 0:
+                results.append({
+                    "variation": var_id,
+                    "metric": var_metric,
+                    "status": "invalid_eval",
+                    "description": f"n_scored=0: {description}",
+                })
+                print(f"  {var_id} no dates scored (n_scored=0), marking invalid_eval", file=sys.stderr)
+                continue
+
+            # Kill gate check (after n_scored==0 invalidation)
+            if not dry_run and kill_gates:
+                kill_reason = check_kill_gates(kill_gates, var_result, baseline_metric)
+                if kill_reason:
+                    killed = True
+                    print(f"  KILL GATE TRIGGERED: {kill_reason}", file=sys.stderr)
+                    results.append({
+                        "variation": var_id,
+                        "metric": var_metric,
+                        "status": "killed",
+                        "description": kill_reason,
+                    })
+                    continue
+
+            # Significance-based keep/discard
             is_better = (
                 var_metric > baseline_metric if direction == "maximize"
                 else var_metric < baseline_metric
             )
-            status = "keep" if is_better else "discard"
+            p_value = var_result.get("p_value") if not dry_run else None
+            is_significant = p_value is not None and p_value < significance_alpha
+
+            if is_better and (is_significant or p_value is None):
+                status = "keep"
+            else:
+                status = "discard"
 
             results.append({
                 "variation": var_id,
@@ -579,8 +818,11 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 "description": description,
             })
 
-            if is_better:
-                print(f"  {var_id} IMPROVED over baseline ({var_metric:.3f} vs {baseline_metric:.3f})", file=sys.stderr)
+            if status == "keep":
+                sig_str = f", p={p_value:.4f}" if p_value is not None else ""
+                print(f"  {var_id} IMPROVED over baseline ({var_metric:.3f} vs {baseline_metric:.3f}{sig_str})", file=sys.stderr)
+            elif is_better and not is_significant:
+                print(f"  {var_id} better but NOT significant (p={p_value:.4f} >= {significance_alpha}), discarding", file=sys.stderr)
 
     finally:
         # Determine if any candidates should be kept
