@@ -311,13 +311,21 @@ def run_backtest(script: str, args_str: str, cwd: str, timeout: int) -> dict:
         "details": parts[5] if len(parts) > 5 else "",
         "raw": stdout,
     }
+    # Propagate n_scored from TSV column 2 (n_total)
+    try:
+        parsed["n_scored"] = int(parts[2])
+    except (ValueError, IndexError):
+        pass
     # Parse extended TSV columns (p_value, CI, significant)
     if len(parts) >= 8:
         try:
             parsed["p_value"] = float(parts[5])
             ci_parts = parts[6].split("-")
-            parsed["ci_lower"] = float(ci_parts[0])
-            parsed["ci_upper"] = float(ci_parts[1]) if len(ci_parts) > 1 else 0.0
+            # Handle 'NA' values in CI (emitted when n_scored==0)
+            ci_lo = ci_parts[0].strip()
+            ci_hi = ci_parts[1].strip() if len(ci_parts) > 1 else ci_lo
+            parsed["ci_lower"] = None if ci_lo == "NA" else float(ci_lo)
+            parsed["ci_upper"] = None if ci_hi == "NA" else float(ci_hi)
             parsed["significant"] = parts[7].strip().lower() == "yes"
             parsed["details"] = parts[8] if len(parts) > 8 else ""
         except (ValueError, IndexError):
@@ -759,7 +767,20 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
 
             print(f"  {var_id} {metric_key}: {var_metric:.3f}", file=sys.stderr)
 
-            # Kill gate check
+            # Mark as invalid if no dates were actually scored — check BEFORE
+            # kill gates so zero-scored evals don't falsely trigger kills.
+            n_scored = var_result.get("n_scored", var_result.get("n_total", -1))
+            if not dry_run and n_scored == 0:
+                results.append({
+                    "variation": var_id,
+                    "metric": var_metric,
+                    "status": "invalid_eval",
+                    "description": f"n_scored=0: {description}",
+                })
+                print(f"  {var_id} no dates scored (n_scored=0), marking invalid_eval", file=sys.stderr)
+                continue
+
+            # Kill gate check (after n_scored==0 invalidation)
             if not dry_run and kill_gates:
                 kill_reason = check_kill_gates(kill_gates, var_result, baseline_metric)
                 if kill_reason:
@@ -772,18 +793,6 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                         "description": kill_reason,
                     })
                     continue
-
-            # Mark as invalid if no dates were actually scored
-            n_scored = var_result.get("n_scored", -1)
-            if not dry_run and n_scored == 0:
-                results.append({
-                    "variation": var_id,
-                    "metric": var_metric,
-                    "status": "invalid_eval",
-                    "description": f"n_scored=0: {description}",
-                })
-                print(f"  {var_id} no dates scored (n_scored=0), marking invalid_eval", file=sys.stderr)
-                continue
 
             # Significance-based keep/discard
             is_better = (
