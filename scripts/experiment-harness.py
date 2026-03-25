@@ -264,12 +264,29 @@ def run_backtest(script: str, args_str: str, cwd: str, timeout: int) -> dict:
     Returns dict with keys: directional_accuracy, weighted_accuracy, details, raw,
     and optionally p_value, ci_lower, ci_upper, significant.
     On failure returns None.
+
+    Note: timeout is per-DATE (each propagate() call), not for the whole run.
+    The subprocess timeout is scaled by the number of dates to allow the full
+    evaluation to complete. backtest-eval.py handles per-date timeouts internally
+    via signal.alarm.
     """
     cmd = [sys.executable, script] + shlex.split(args_str)
+    # Scale subprocess timeout by number of dates (+ buffer for startup/eval overhead)
+    n_dates = 50  # default
+    parts = shlex.split(args_str)
+    for i, p in enumerate(parts):
+        if p == "--n-dates" and i + 1 < len(parts):
+            try:
+                n_dates = int(parts[i + 1])
+            except ValueError:
+                pass
+        elif p == "--dates" and i + 1 < len(parts):
+            n_dates = len(parts[i + 1].split(","))
+    subprocess_timeout = timeout * n_dates + 300  # per-date timeout × dates + 5 min buffer
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            cwd=cwd, timeout=timeout,
+            cwd=cwd, timeout=subprocess_timeout,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
