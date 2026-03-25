@@ -540,6 +540,10 @@ def check_kill_gates(kill_gates: dict, var_result: dict, baseline_metric: float)
     if not kill_gates:
         return None
 
+    n_scored = var_result.get('n_scored', var_result.get('n_total', -1))
+    if n_scored == 0:
+        return None  # No scored data — cannot evaluate kill gates
+
     accuracy = var_result.get("directional_accuracy", 0.0)
 
     max_acc = kill_gates.get("max_accuracy_for_kill")
