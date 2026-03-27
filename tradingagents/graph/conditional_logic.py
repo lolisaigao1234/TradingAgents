@@ -30,28 +30,30 @@ class ConditionalLogic:
 
     def should_retry_after_evaluation(self, state: AgentState) -> str:
         """Route after evaluator: pass -> Trader, fail -> Retry Gate."""
+        eval_retry_count = state.get("eval_retry_count", 0)
+
         report_str = state.get("evaluation_report", "")
         if not report_str:
-            return "Trader"
+            # Fail-closed: missing report = failed evaluation
+            return "Trader" if eval_retry_count >= 2 else "Retry Gate"
         try:
             report = json.loads(report_str)
         except (json.JSONDecodeError, ValueError):
-            # Fail-closed: unparseable report = retry
-            return "Retry Gate"
+            # Fail-closed: unparseable report = failed evaluation
+            return "Trader" if eval_retry_count >= 2 else "Retry Gate"
 
         passed = report.get("pass", False)
         # Bool coercion: handle LLM returning "false" as string
         if isinstance(passed, str):
             passed = passed.lower() != "false"
 
-        # Force-proceed to Trader after max retries even if evaluation failed,
-        # but the failing evaluation_report is preserved so downstream knows
-        # quality was poor.
-        eval_retry_count = state.get("eval_retry_count", 0)
-        if not passed and eval_retry_count >= 2:
+        if passed:
             return "Trader"
 
-        return "Trader" if passed else "Retry Gate"
+        # Failed evaluation: force-proceed after max retries, otherwise retry.
+        # The failing evaluation_report is preserved so downstream knows
+        # quality was poor.
+        return "Trader" if eval_retry_count >= 2 else "Retry Gate"
 
     def should_continue_risk_analysis(self, state: AgentState) -> str:
         """Determine if risk analysis should continue."""
