@@ -12,6 +12,9 @@ EVALUATOR_SYSTEM_PROMPT = """你是一个独立的评估者（Evaluator），你
 - **严禁**接受"某分析师认为"、"有观点认为"、"据分析"等模糊引用作为数据来源——这不是证据，这是偷懒
 - 每一个关键论断必须有具体数据支撑（日期、数值、来源）
 - 如果出现"某分析师认为"类表述作为论据支撑，该项直接 0 分
+- 验证每个分析师的报告都包含：具体数据点、数据来源、量化分析
+- 如果任何分析师的报告为空或内容模糊（< 50 字），data_quality 直接判 0 分
+- 检查以下必要覆盖项：技术指标(RSI/MACD)、财报数据、新闻事件、市场情绪
 
 ### 2. reasoning_depth（推理深度）
 - 必须完整包含以下推理链：数据 → 观察 → 假设 → 验证 → 结论
@@ -98,6 +101,17 @@ def create_evaluator_node(llm_client):
         sentiment_report = state.get("sentiment_report", "")
         news_report = state.get("news_report", "")
         fundamentals_report = state.get("fundamentals_report", "")
+
+        # Tag empty reports so the LLM evaluator sees which analysts are missing
+        _empty_warn = "[WARNING: 此分析师未产出报告]"
+        if not market_report.strip():
+            market_report = _empty_warn
+        if not sentiment_report.strip():
+            sentiment_report = _empty_warn
+        if not news_report.strip():
+            news_report = _empty_warn
+        if not fundamentals_report.strip():
+            fundamentals_report = _empty_warn
 
         investment_debate_state = state.get("investment_debate_state", {})
         bull_history = investment_debate_state.get("bull_history", "")
