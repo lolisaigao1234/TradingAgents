@@ -576,8 +576,14 @@ def check_kill_gates(kill_gates: dict, var_result: dict, baseline_metric: float)
     accuracy = var_result.get("directional_accuracy", 0.0)
 
     max_acc = kill_gates.get("max_accuracy_for_kill")
-    if max_acc is not None and accuracy <= max_acc and baseline_metric <= max_acc:
-        return f"kill_gate: both baseline ({baseline_metric:.3f}) and variation ({accuracy:.3f}) <= max_accuracy_for_kill ({max_acc})"
+    if max_acc is not None and isinstance(max_acc, (int, float)):
+        auto_resolved = kill_gates.get("_auto_resolved", False)
+        if auto_resolved:
+            # Auto mode: kill if variation is significantly worse than baseline
+            if accuracy <= max_acc:
+                return f"kill_gate: variation ({accuracy:.3f}) <= auto-resolved threshold ({max_acc:.3f})"
+        elif accuracy <= max_acc and baseline_metric <= max_acc:
+            return f"kill_gate: both baseline ({baseline_metric:.3f}) and variation ({accuracy:.3f}) <= max_accuracy_for_kill ({max_acc})"
 
     min_ceiling = kill_gates.get("min_ceiling")
     if min_ceiling is not None:
@@ -665,6 +671,7 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
         # Resolve 'auto' kill gate: set max_accuracy_for_kill = baseline - 0.15
         if kill_gates and kill_gates.get("max_accuracy_for_kill") == "auto":
             kill_gates["max_accuracy_for_kill"] = max(baseline_metric - 0.15, 0.0)
+            kill_gates["_auto_resolved"] = True
             print(f"  Kill gate auto-resolved: max_accuracy_for_kill = {kill_gates['max_accuracy_for_kill']:.3f}", file=sys.stderr)
 
         # Resolve dates for early-stop (Issue #9)
