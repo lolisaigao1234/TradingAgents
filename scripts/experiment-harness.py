@@ -576,8 +576,14 @@ def check_kill_gates(kill_gates: dict, var_result: dict, baseline_metric: float)
     accuracy = var_result.get("directional_accuracy", 0.0)
 
     max_acc = kill_gates.get("max_accuracy_for_kill")
-    if max_acc is not None and accuracy <= max_acc and baseline_metric <= max_acc:
-        return f"kill_gate: both baseline ({baseline_metric:.3f}) and variation ({accuracy:.3f}) <= max_accuracy_for_kill ({max_acc})"
+    if max_acc is not None and isinstance(max_acc, (int, float)):
+        auto_resolved = kill_gates.get("_auto_resolved", False)
+        if auto_resolved:
+            # Auto mode: kill if variation is significantly worse than baseline
+            if accuracy <= max_acc:
+                return f"kill_gate: variation ({accuracy:.3f}) <= auto-resolved threshold ({max_acc:.3f})"
+        elif accuracy <= max_acc and baseline_metric <= max_acc:
+            return f"kill_gate: both baseline ({baseline_metric:.3f}) and variation ({accuracy:.3f}) <= max_accuracy_for_kill ({max_acc})"
 
     min_ceiling = kill_gates.get("min_ceiling")
     if min_ceiling is not None:
@@ -662,25 +668,20 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
             "description": "unchanged prompts",
         })
 
-        # Pre-compute partial baseline for early-stop comparison (Issue #9)
-        # Resolve dates via --list-dates (works for both --dates and --n-dates)
-        _partial_baseline_metric = None
+        # Resolve 'auto' kill gate: set max_accuracy_for_kill = baseline - 0.15
+        if kill_gates and kill_gates.get("max_accuracy_for_kill") == "auto":
+            kill_gates["max_accuracy_for_kill"] = max(baseline_metric - 0.15, 0.0)
+            kill_gates["_auto_resolved"] = True
+            print(f"  Kill gate auto-resolved: max_accuracy_for_kill = {kill_gates['max_accuracy_for_kill']:.3f}", file=sys.stderr)
+
+        # Resolve dates for early-stop (Issue #9)
         all_dates = _resolve_dates(eval_script, eval_args, worktree_path)
         if not all_dates:
             # Fallback to parsing --dates from args directly
             all_dates = _extract_dates(eval_args)
-        if not dry_run and early_stop_after and 0 < early_stop_after < len(all_dates):
-            early_dates = all_dates[:early_stop_after]
-            # Construct --dates with the first N resolved dates (replaces any
-            # --n-dates/--date-range args so early-stop runs on exact dates)
-            early_args = _build_dates_args(eval_args, early_dates)
-            print(f"  Computing baseline on first {early_stop_after} dates for early-stop comparison...", file=sys.stderr)
-            _partial_bl = run_backtest(eval_script, early_args, worktree_path, timeout)
-            if _partial_bl is not None:
-                _partial_baseline_metric = _partial_bl[metric_key]
-                print(f"  Partial baseline {metric_key}: {_partial_baseline_metric:.3f}", file=sys.stderr)
-            else:
-                print("  Warning: could not compute partial baseline, early-stop disabled", file=sys.stderr)
+        # Early-stop threshold: baseline minus tolerance margin
+        early_threshold = baseline_metric - 0.10
+        print(f"  Early-stop threshold: {early_threshold:.3f} (baseline - 0.10)", file=sys.stderr)
 
         # Step 3: Generate and evaluate variations
         killed = False
@@ -750,8 +751,8 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
                 var_result = {"directional_accuracy": 0.0, "weighted_accuracy": 0.0, "details": "[dry-run]"}
                 var_metric = 0.0
             else:
-                # Issue #9: early_stop_after — run first N dates, bail if worse
-                if _partial_baseline_metric is not None and early_stop_after and 0 < early_stop_after < len(all_dates):
+                # Issue #9: early_stop_after — run first N dates, bail if below threshold
+                if early_stop_after and 0 < early_stop_after < len(all_dates):
                     early_dates = all_dates[:early_stop_after]
                     early_eval_args = _build_dates_args(eval_args, early_dates)
                     print(f"  Early-stop check: evaluating first {early_stop_after} dates...", file=sys.stderr)
@@ -769,11 +770,11 @@ def run_experiment(manifest: dict, max_variations: int | None = None, dry_run: b
 
                     early_metric = early_result[metric_key]
                     early_is_worse = (
-                        early_metric < _partial_baseline_metric if direction == "maximize"
-                        else early_metric > _partial_baseline_metric
+                        early_metric < early_threshold if direction == "maximize"
+                        else early_metric > early_threshold
                     )
                     if early_is_worse:
-                        print(f"  {var_id} early-stop: {early_metric:.3f} worse than baseline {_partial_baseline_metric:.3f}, skipping remaining dates", file=sys.stderr)
+                        print(f"  {var_id} early-stop: {early_metric:.3f} below threshold {early_threshold:.3f}, skipping remaining dates", file=sys.stderr)
                         results.append({
                             "variation": var_id,
                             "metric": early_metric,

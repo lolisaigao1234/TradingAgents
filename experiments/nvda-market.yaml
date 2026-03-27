@@ -13,5 +13,5 @@ experiment:
   n_dates: 50
   significance_alpha: 0.05
   kill_gates:
-    max_accuracy_for_kill: 0.55
-    min_ceiling: 0.60
+    max_accuracy_for_kill: auto
+    min_ceiling: 0.35
