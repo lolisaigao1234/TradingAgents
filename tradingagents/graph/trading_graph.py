@@ -92,6 +92,12 @@ class TradingAgentsGraph:
             max_debate_rounds=self.config["max_debate_rounds"],
             max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
         )
+        # Create evaluator node if enabled
+        evaluator_node = None
+        enable_evaluator = self.config.get("enable_evaluator", False)
+        if enable_evaluator:
+            evaluator_node = create_evaluator_node(self.quick_thinking_llm)
+
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
@@ -101,6 +107,8 @@ class TradingAgentsGraph:
             self.invest_judge_memory,
             self.risk_manager_memory,
             self.conditional_logic,
+            evaluator_node=evaluator_node,
+            enable_evaluator=enable_evaluator,
         )
 
         self.propagator = Propagator()
