@@ -45,7 +45,7 @@ class ConditionalLogic:
         passed = report.get("pass", False)
         # Bool coercion: handle LLM returning "false" as string
         if isinstance(passed, str):
-            passed = passed.lower() != "false"
+            passed = passed.lower() in ("true", "1", "yes")
 
         if passed:
             return "Trader"
