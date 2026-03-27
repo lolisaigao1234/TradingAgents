@@ -1,5 +1,7 @@
 # TradingAgents/graph/conditional_logic.py
 
+import json
+
 from tradingagents.agents.utils.agent_states import AgentState
 
 
@@ -25,6 +27,24 @@ class ConditionalLogic:
         if state["investment_debate_state"]["current_response"].startswith("Bull"):
             return "Bear Researcher"
         return "Bull Researcher"
+
+    def should_retry_after_evaluation(self, state: AgentState) -> str:
+        """Route after evaluator: pass -> Trader, fail -> Retry Gate."""
+        report_str = state.get("evaluation_report", "")
+        if not report_str:
+            return "Trader"
+        try:
+            report = json.loads(report_str)
+        except (json.JSONDecodeError, ValueError):
+            # Fail-closed: unparseable report = retry
+            return "Retry Gate"
+
+        passed = report.get("pass", False)
+        # Bool coercion: handle LLM returning "false" as string
+        if isinstance(passed, str):
+            passed = passed.lower() != "false"
+
+        return "Trader" if passed else "Retry Gate"
 
     def should_continue_risk_analysis(self, state: AgentState) -> str:
         """Determine if risk analysis should continue."""

@@ -22,6 +22,8 @@ class GraphSetup:
         invest_judge_memory,
         risk_manager_memory,
         conditional_logic: ConditionalLogic,
+        evaluator_node=None,
+        enable_evaluator: bool = False,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -32,6 +34,8 @@ class GraphSetup:
         self.invest_judge_memory = invest_judge_memory
         self.risk_manager_memory = risk_manager_memory
         self.conditional_logic = conditional_logic
+        self.evaluator_node = evaluator_node
+        self.enable_evaluator = enable_evaluator
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -140,7 +144,27 @@ class GraphSetup:
                 "Research Manager": "Research Manager",
             },
         )
-        workflow.add_edge("Research Manager", "Trader")
+        if self.enable_evaluator and self.evaluator_node is not None:
+            # Evaluator + Retry Gate pattern
+            workflow.add_node("Evaluator", self.evaluator_node)
+            retry_gate = create_retry_gate_node()
+            workflow.add_node("Retry Gate", retry_gate)
+            workflow.add_edge("Research Manager", "Evaluator")
+            workflow.add_conditional_edges(
+                "Evaluator",
+                self.conditional_logic.should_retry_after_evaluation,
+                {
+                    "Trader": "Trader",
+                    "Retry Gate": "Retry Gate",
+                },
+            )
+            # Retry Gate fans out to all analysts in parallel
+            for analyst_type in selected_analysts:
+                workflow.add_edge(
+                    "Retry Gate", f"{analyst_type.capitalize()} Analyst"
+                )
+        else:
+            workflow.add_edge("Research Manager", "Trader")
         workflow.add_edge("Trader", "Aggressive Analyst")
         workflow.add_conditional_edges(
             "Aggressive Analyst",

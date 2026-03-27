@@ -24,6 +24,8 @@ DEFAULT_CONFIG = {
     # LLM request settings
     "llm_timeout": 120,       # per-request timeout in seconds
     "llm_max_retries": 1,     # max retries on transient failures
+    # Evaluator settings
+    "enable_evaluator": False,
     # Debate and discussion settings
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
