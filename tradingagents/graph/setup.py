@@ -1,5 +1,6 @@
 # TradingAgents/graph/setup.py
 
+import logging
 from typing import Dict, Any
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
@@ -7,6 +8,8 @@ from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
 
 from .conditional_logic import ConditionalLogic
+
+logger = logging.getLogger(__name__)
 
 
 class GraphSetup:
@@ -120,12 +123,23 @@ class GraphSetup:
         for analyst_type in selected_analysts:
             workflow.add_edge(START, f"{analyst_type.capitalize()} Analyst")
 
-        # Each analyst runs its tool loop internally and writes to its
-        # report field, then fans-in to Bull Researcher
+        # Lightweight empty-report check after analyst fan-in, before debate
+        _report_field = {"market": "market_report", "social": "sentiment_report",
+                         "news": "news_report", "fundamentals": "fundamentals_report"}
+
+        def _check_empty_reports(state):
+            for a in selected_analysts:
+                f = _report_field.get(a)
+                if f and not state.get(f, "").strip():
+                    logger.warning("Analyst '%s' produced an empty report (field: %s)", a, f)
+            return {}
+
+        workflow.add_node("Report Check", _check_empty_reports)
         for analyst_type in selected_analysts:
             workflow.add_edge(
-                f"{analyst_type.capitalize()} Analyst", "Bull Researcher"
+                f"{analyst_type.capitalize()} Analyst", "Report Check"
             )
+        workflow.add_edge("Report Check", "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(
