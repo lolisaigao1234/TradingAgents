@@ -73,18 +73,20 @@ def create_evaluator_node(llm_client):
     def evaluator_node(state) -> dict:
         eval_retry_count = state.get("eval_retry_count", 0)
 
-        # Force-pass after 2 retries to prevent infinite loops
+        # Fail-closed after max retries: emit a FAILED report so downstream
+        # knows quality was poor.  Routing (force-proceed to Trader) is
+        # handled by conditional_logic.should_retry_after_evaluation.
         if eval_retry_count >= 2:
             return {
                 "evaluation_report": json.dumps(
                     {
-                        "data_quality": 6,
-                        "reasoning_depth": 6,
-                        "consistency": 6,
-                        "actionability": 6,
-                        "total": 24,
-                        "pass": True,
-                        "reasoning": "已达到最大重试次数（2次），强制通过。",
+                        "data_quality": 0,
+                        "reasoning_depth": 0,
+                        "consistency": 0,
+                        "actionability": 0,
+                        "total": 0,
+                        "pass": False,
+                        "reasoning": "max retries exceeded - analysis quality insufficient",
                     },
                     ensure_ascii=False,
                 ),
@@ -201,10 +203,13 @@ def _parse_and_validate(raw_content: str) -> dict:
     dimensions = ["data_quality", "reasoning_depth", "consistency", "actionability"]
     for dim in dimensions:
         val = parsed.get(dim, 0)
-        try:
-            val = float(val)
-        except (TypeError, ValueError):
+        if isinstance(val, bool):
             val = 0
+        else:
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                val = 0
         parsed[dim] = max(0, min(10, val))
 
     # Recompute total server-side (don't trust LLM's arithmetic)

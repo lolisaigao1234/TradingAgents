@@ -44,6 +44,13 @@ class ConditionalLogic:
         if isinstance(passed, str):
             passed = passed.lower() != "false"
 
+        # Force-proceed to Trader after max retries even if evaluation failed,
+        # but the failing evaluation_report is preserved so downstream knows
+        # quality was poor.
+        eval_retry_count = state.get("eval_retry_count", 0)
+        if not passed and eval_retry_count >= 2:
+            return "Trader"
+
         return "Trader" if passed else "Retry Gate"
 
     def should_continue_risk_analysis(self, state: AgentState) -> str:
