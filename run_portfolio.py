@@ -194,7 +194,7 @@ def main():
     # Save results (merge with existing file for same date if running single batch)
     out_file = f"portfolio_{analysis_date}.json"
     existing = {}
-    if batch_num is not None and os.path.exists(out_file):
+    if os.path.exists(out_file):
         with open(out_file) as f:
             existing = json.load(f).get("results", {})
     existing.update(all_results)
